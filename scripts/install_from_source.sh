@@ -46,6 +46,8 @@ say "CUDA_HOME=$CUDA_HOME CC=$CC MAX_JOBS=$MAX_JOBS"
 
 [ -x "$VENV/bin/python" ] || "$PYTHON" -m venv "$VENV"
 PY="$VENV/bin/python"
+# The build must use the venv's cmake (>= 3.26) and ninja, not whatever the system has.
+export PATH="$VENV/bin:$PATH"
 "$PY" -m pip install --upgrade pip
 say "installing the pinned environment (requirements-sm70.txt)"
 "$PY" -m pip install -r "$REPO/requirements-sm70.txt"
