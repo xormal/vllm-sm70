@@ -59,6 +59,9 @@ Details, tools and known effects: [docs/sm70/VALIDATION.md](docs/sm70/VALIDATION
 ## Requirements
 
 * 2× NVIDIA V100 32 GB (tested: one NVLink pair and one PCIe pair), driver supporting CUDA 12.8 (tested 580).
+  The two GPUs must be **dedicated** to the server: the memory plan is fixed (`--kv-cache-memory-bytes`,
+  `--gpu-memory-utilization 0.96`), so another process allocating GPU memory while the server starts makes the
+  start fail with an out-of-memory error.
 * CUDA **12.8** toolkit (`nvcc`) and a host gcc it accepts (tested gcc 11.4). The sm70 kernels are JIT-compiled.
 * Python **3.12**, ≥ 32 GB RAM for the build with `MAX_JOBS=8` (~3 GB per job), ~35 GB disk for the model, ~2 GB for build products.
 
