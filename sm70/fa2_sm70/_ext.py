@@ -286,10 +286,10 @@ def tm8_ext():
     if _tm8 is None:
         _common()
         tm_root = os.environ.get(
-            "FA2SM70_TM_ROOT", os.path.join(_ROOT, "third_party", "turbomind"))
+            "FA2SM70_TM_ROOT", os.path.join(_ROOT, "third_party", "sm70_turbomind", "lmdeploy"))
         if not os.path.isdir(os.path.join(tm_root, "src", "turbomind")):
             raise RuntimeError(f"fa2_sm70: turbomind headers not found at {tm_root} "
-                               f"(set FA2SM70_TM_ROOT to sm70/third_party/turbomind)")
+                               f"(set FA2SM70_TM_ROOT to sm70/third_party/sm70_turbomind/lmdeploy)")
         # torch вкалывает -D__CUDA_NO_HALF_* по умолчанию; turbomind живёт операторами half —
         # снимаем их так же, как это делает сборка самого форка.
         _tm8 = _build("fa2sm70_tm8", "tm8_gemm.cu",

@@ -33,7 +33,7 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | Lever | Value | Effect |
 |---|---|---|
 | `FA2SM70_W8` | `1` | GPTQ-int8 GEMV on our tensor-core kernel for small M (decode); larger M goes to the turbomind body |
-| `FA2SM70_TM8`, `FA2SM70_TM8_ONLY`, `FA2SM70_TM8_NMIN` | `1`, `1`, `3072` | turbomind s884 int8 GEMM (`sm70/third_party/turbomind`) for prefill-size M; with `TM8_ONLY` the original GPTQ layout is freed after repacking |
+| `FA2SM70_TM8`, `FA2SM70_TM8_ONLY`, `FA2SM70_TM8_NMIN` | `1`, `1`, `3072` | turbomind s884 int8 GEMM (`sm70/third_party/sm70_turbomind`) for prefill-size M; with `TM8_ONLY` the original GPTQ layout is freed after repacking |
 | `FA2SM70_TM8_RECON_MMIN`, `FA2SM70_TM8_RECON_NCH`, `FA2SM70_TM8_RECON_OUT` | `1024`, `4`, `1` | For M ≥ 1024, reconstruct fp16 weight chunks and use cuBLAS (×1.21 on the linear part), writing straight into the output slice |
 | `FA2SM70_W12` | `1` | `self_attn.{q,k,v}_proj` (kept BF16 in the checkpoint) repacked to 12-bit at load and served by the W12A16 kernel; packed weights cached in `FA2SM70_W12_CACHE` |
 | `FA2SM70_LMH` | `1` | int8 `lm_head` on our kernel (top-512 candidates, exact rescoring); frees ~620 MB per rank |

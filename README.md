@@ -182,7 +182,7 @@ csrc/, flash-attention-v100/, lmdeploy/  1Cat-vLLM C++/CUDA (GPTQ/AWQ sm70 GEMM,
 sm70/                     Volta kernel library and integration layer (MIT)
   fa2_sm70/               JIT CUDA extensions (prefill, decode, GDN, W8/W12/tm8, exchange, Clef, ...)
   fa2_src/                bundled CUTLASS headers (BSD-3-Clause) and Volta FMHA primitives
-  third_party/turbomind/  TurboMind GEMM headers used by the tm8 extension (Apache-2.0)
+  third_party/sm70_turbomind/  TurboMind GEMM headers used by the tm8 extension (Apache-2.0)
   integrations/vllm_sm70/ runtime layer loaded via sitecustomize: linear paths, all-reduce, MTP head,
                           flash_attn_v100 shim, Clef (fa2sm70_clef*.py, clef/), quantize/
   docs/, tests/, benchmarks/   kernel documentation and oracle tests; see sm70/README.md
@@ -224,7 +224,7 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
 * vLLM and 1Cat-vLLM code (everything outside `sm70/`): Apache License 2.0, see [LICENSE](LICENSE).
 * `sm70/`: MIT, see [sm70/LICENSE](sm70/LICENSE), except the vendored third-party code:
   CUTLASS in `sm70/fa2_src/cutlass` (BSD-3-Clause, see its `LICENSE.txt`) and TurboMind headers in
-  `sm70/third_party/turbomind` (Apache-2.0, see its `LICENSE`).
+  `sm70/third_party/sm70_turbomind` (Apache-2.0, see its `LICENSE`).
 * Model weights are distributed separately under Apache-2.0 (see the model card).
 
 ## Acknowledgements
