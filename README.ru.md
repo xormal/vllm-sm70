@@ -11,16 +11,16 @@ Volta, слой интеграции, пускач и набор рычагов 
 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), который сам является форком
 [vllm-project/vllm](https://github.com/vllm-project/vllm) под Volta. Ветка `sm70`.
 
+Веса модели и адаптеры Clef: **[alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef)** на Hugging Face.
+
 | | |
 |---|---|
-| **Модель** | [Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef) ¹ — int8 GPTQ сети [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16) (база — [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) и адаптеры для [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) |
+| **Модель** | [Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef) — int8 GPTQ сети [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16) (база — [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) и адаптеры для [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) |
 | **Железо** | 2× NVIDIA V100 32 ГБ, тензорный параллелизм 2, NVLink или PCIe |
 | **Контекст** | 262 144 токена, KV-кэш int8 |
 | **Модальности** | текст, картинки, видео, вызовы инструментов (OpenAI-совместимый API) |
 | **Решения** | `POST /v1/systemone` — Clef (API Jev/SystemOne) на тех же весах; память: +0.29 / +0.12 ГБ |
 | **Спекуляция** | родная голова MTP, k = 3, плюс n-граммы |
-
-¹ Предполагаемые публичные адреса модели и репозитория. До публикации ссылки могут не открываться.
 
 ## Зачем
 
@@ -78,7 +78,7 @@ CUDA_HOME=/usr/local/cuda-12.8 MAX_JOBS=8 scripts/install_from_source.sh
 ## Запуск
 
 ```bash
-huggingface-cli download xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
+huggingface-cli download alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
     --local-dir /models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef
 
 PY=.venv/bin/python MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \

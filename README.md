@@ -11,16 +11,16 @@ fork, the Volta kernel library and the integration layer, with the launcher and 
 running server. It is a fork of [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (a Volta-focused
 fork of [vllm-project/vllm](https://github.com/vllm-project/vllm)), branch `sm70`.
 
+Model weights and Clef adapters: **[alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef)** on Hugging Face.
+
 | | |
 |---|---|
-| **Model** | [Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef) ¹ (int8 GPTQ of [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16), base [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) + adapters for [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) |
+| **Model** | [Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef) (int8 GPTQ of [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16), base [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) + adapters for [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) |
 | **Hardware** | 2× NVIDIA V100 32 GB, tensor parallel 2, NVLink or PCIe |
 | **Context** | 262,144 tokens, int8 KV cache |
 | **Modalities** | text, images, video, tool calls (OpenAI-compatible API) |
 | **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, +0.29 / +0.12 GB of GPU memory |
 | **Speculation** | native MTP head, k = 3, with n-gram assist |
-
-¹ Intended public locations of the model and this repository. Until they are published the links may not resolve.
 
 ---
 
@@ -93,7 +93,7 @@ point it at local checkouts at the pinned revisions instead:
 ## Serving
 
 ```bash
-huggingface-cli download xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
+huggingface-cli download alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
     --local-dir /models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef
 
 PY=.venv/bin/python MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
