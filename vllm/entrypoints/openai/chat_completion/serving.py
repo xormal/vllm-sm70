@@ -781,7 +781,7 @@ class OpenAIServingChat(OpenAIServing):
                                 total_tokens=num_prompt_tokens,
                             )
 
-                        data = chunk.model_dump_json(exclude_unset=True)
+                        data = chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                         yield f"data: {data}\n\n"
 
                     # Send response to echo the input portion of the
@@ -817,7 +817,7 @@ class OpenAIServingChat(OpenAIServing):
                                         total_tokens=num_prompt_tokens,
                                     )
 
-                                data = chunk.model_dump_json(exclude_unset=True)
+                                data = chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                                 yield f"data: {data}\n\n"
                     first_iteration = False
 
@@ -1326,7 +1326,7 @@ class OpenAIServingChat(OpenAIServing):
                             total_tokens=num_prompt_tokens + completion_tokens,
                         )
 
-                    data = chunk.model_dump_json(exclude_unset=True)
+                    data = chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage

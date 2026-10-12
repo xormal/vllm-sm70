@@ -53,6 +53,17 @@ at::Tensor flash_attention_prefill_paged(
     const float v_scale
 );
 
+void reshape_and_cache_fp8_v100(
+    const at::Tensor& key,
+    const at::Tensor& value,
+    at::Tensor& key_cache,
+    at::Tensor& value_cache,
+    const at::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype,
+    const double k_scale,
+    const double v_scale
+);
+
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout,
     const at::Tensor& q,

@@ -27,6 +27,7 @@ def get_ext_modules():
                 "kernel/fused_mha_forward_paged.cu",
                 "kernel/flash_decode_paged.cu",
                 "kernel/fused_mha_backward.cu",
+                "kernel/reshape_and_cache_fp8.cu",
             ],
             include_dirs=[this_dir / "include", this_dir / "kernel"],
             extra_compile_args={
@@ -40,7 +41,6 @@ def get_ext_modules():
                     "-U__CUDA_NO_HALF2_OPERATORS__",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
-                    "--use_fast_math",
                 ],
             },
         ),
@@ -57,7 +57,6 @@ def get_ext_modules():
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "--use_fast_math",
                 ],
             },
         )

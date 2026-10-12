@@ -20,4 +20,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "prefill_paged_fwd",
         &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
+    m.def(
+        "reshape_and_cache_fp8",
+        &reshape_and_cache_fp8_v100,
+        "Quantize+write K/V into paged fp8 KV cache (e4m3/e5m2, Volta)");
 }

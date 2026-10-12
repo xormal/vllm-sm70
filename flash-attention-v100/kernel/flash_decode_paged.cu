@@ -247,7 +247,7 @@ __global__ void flash_attention_decode_partition_kernel(
 
   float local_sum = 0.f;
   for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
-    const float p = __expf(scores_shared[i] - part_max);
+    const float p = expf(scores_shared[i] - part_max);
     scores_shared[i] = p;
     local_sum += p;
   }
@@ -345,7 +345,7 @@ __global__ void flash_attention_decode_reduce_kernel(
     const int64_t stats_index =
         static_cast<int64_t>(batch_idx) * stats_stride0 +
         static_cast<int64_t>(head_idx) * stats_stride1 + i;
-    const float weight = exp_sums[stats_index] * __expf(max_shared[i] - global_max);
+    const float weight = exp_sums[stats_index] * expf(max_shared[i] - global_max);
     weight_shared[i] = weight;
     local_sum += weight;
   }

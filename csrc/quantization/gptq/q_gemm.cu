@@ -5,6 +5,8 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // [fa2_sm70] getenv for the VLLM_GPTQ_ZERO_C switch
+#include <cstring>   // [fa2_sm70] strcmp for the VLLM_GPTQ_ZERO_C modes
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -26,7 +28,7 @@ namespace gptq {
 #define BLOCK_M_SIZE_MAX 8
 #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
 #define MAX_Q_GEMM_ROWS 50
-#define MAX_Q_GEMM_ROWS_8BIT 24
+#define MAX_Q_GEMM_ROWS_8BIT 32  // [fa2_sm70] было 24. Цена квантованной ветви = ceil(M/8) проходов по весу (BLOCK_M_SIZE_MAX=8), reconstruct = плоские ~5 проходов, поэтому порог обязан быть КРАТЕН 8. Замерено (EV_door_reconstruct.md §5, S3): M=32 -> 291.4 мкс против 317.5 у reconstruct (выигрыш 8.2%), M=33 -> 336.1 (ПРОИГРЫШ 5.9%). Значение 33 из EV_exllama_threshold.md выбрано без точки M=33 в свипе. MAX_Q_GEMM_ROWS (4 бита) НЕ ТРОГАЕМ.
 #define MAX_ALT_GEMM_ROWS 8
 #define THREADS_X 32
 #define THREADS_Y 32
@@ -1491,6 +1493,25 @@ void reconstruct_gptq(const uint32_t* b_q_weight, const uint32_t* b_gptq_qzeros,
                                            width, groups, use_v2_format, out);
 }
 
+// [fa2_sm70] THE SAME PREDICATE, ONE PLACE. gptq_gemm() below must know which branch
+// gemm_half_q_half_cuda() will take, because only the branch matters for whether C has
+// to arrive zeroed:
+//   * reconstruct  -> cublasHgemm with beta = 0, which does NOT read C: zeroing is DEAD
+//                     (measured: 69.7 GB of pure writes per 16384-token chunk at TP=2 on
+//                      this model, 83.5 ms/chunk, 1.27 s over a 250K prefill);
+//   * quantized/alt -> the kernels accumulate with atomicAdd over a blockIdx.z split of k,
+//                     so C is the accumulator and MUST start at zero.
+// Factored out rather than copied so the two cannot drift apart.
+inline bool gptq_gemm_uses_reconstruct(int size_m, bool use_exllama, int bit) {
+  if (use_exllama) {
+    return ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
+            (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
+  }
+  // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
+  // we disabled them for now.
+  return (bit < 4 || size_m > MAX_ALT_GEMM_ROWS);
+}
+
 void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
                            const uint32_t* b_q_weight,
                            const uint32_t* b_gptq_qzeros,
@@ -1498,15 +1519,8 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
                            half* c, half* temp_dq, int size_m, int size_n,
                            int size_k, int groups, bool use_exllama,
                            bool use_v2_format, int bit) {
-  bool use_reconstruct;
-  if (use_exllama) {
-    use_reconstruct = ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
-                       (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
-  } else {
-    // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
-    // we disabled them for now.
-    use_reconstruct = (bit < 4 || size_m > MAX_ALT_GEMM_ROWS);
-  }
+  const bool use_reconstruct =
+      gptq_gemm_uses_reconstruct(size_m, use_exllama, bit);
   if (use_reconstruct) {
     // Reconstruct FP16 matrix, then cuBLAS
     if (use_exllama) {
@@ -1822,6 +1836,103 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height,
   shuffle_kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, height, width);
 }
 
+// ============================ [fa2_sm70 / ПАРА-1] ============================
+// ПАССАЖИР ОБНУЛЕНИЯ: 236 ядер-заливок на токен -> ОДИН узел графа.
+//
+// ЗАЧЕМ. На декодном пути (size_m <= 24 при 8 битах) ядро gemm_half_q_half_gptq_*
+// накапливает в C через atomicAdd по расщеплению k (gridDim.z = size_k/128), поэтому C
+// ОБЯЗАН приходить нулевым -- убрать нули нельзя. Но по трассе боевого декода каждая
+// такая заливка стоит 1.888 мкс ядра + 0.951 мкс зазора между узлами графа при полезной
+// работе 2.5-17 КБ (0.02 мкс по полосе): это 99% ЧИСТАЯ ЦЕНА СУЩЕСТВОВАНИЯ ЗАПУСКА.
+// 236 заливок = 0.655 мс = 2.1% токена.
+//
+// КАК. Выходы декодных умножений берутся не у аллокатора, а из ПОСТОЯННОЙ плиты
+// (cudaMalloc вне графа). Внутри одного захвата смещения детерминированы, поэтому в графе
+// они зафиксированы. Вся плита зануляется ОДНИМ cudaMemsetAsync на первом умножении
+// токена: к этому моменту выходы ПРЕДЫДУЩЕГО токена уже прочитаны и мертвы.
+//
+// ПОЧЕМУ ЭТО БЕЗОПАСНО. (1) внутри захвата указатель плиты монотонно растёт -- два
+// умножения одного токена никогда не делят слот; (2) слот p переиспользуется только
+// умножением p следующего токена; (3) если слот не помещается -- честный откат на
+// torch::zeros (правильно, просто медленно); (4) режим включается только переменной
+// VLLM_GPTQ_ZERO_C=fold и только внутри захвата графа.
+namespace {
+struct ZeroSlab {
+  void* base = nullptr;
+  size_t bytes = 0;      // размер плиты И размер обнуления в начале токена
+  size_t bump = 0;       // указатель внутри текущего захвата
+  bool in_capture = false;
+  bool tried = false;
+  int call = 0;
+  long long folded = 0, fallback = 0;
+};
+ZeroSlab g_zslab;
+}  // namespace
+
+// Плиту строим ТОЛЬКО вне захвата (cudaMalloc при захвате запрещён), поэтому зовём это
+// на КАЖДОМ вызове gptq_gemm, а не только на квантованной ветке: профилировочный прогон
+// vLLM идёт по ветке reconstruct, и если ждать первого квантованного вызова вне графа,
+// плиты может не оказаться к моменту захвата -- режим тихо не включится.
+void fold_maybe_init() {
+  if (g_zslab.tried) return;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return;
+  if (st == cudaStreamCaptureStatusActive) return;
+  g_zslab.tried = true;
+  const char* mb = std::getenv("VLLM_GPTQ_FOLD_MB");
+  size_t want = (size_t)((mb && *mb) ? atoi(mb) : 8) << 20;
+  if (cudaMalloc(&g_zslab.base, want) == cudaSuccess &&
+      cudaMemset(g_zslab.base, 0, want) == cudaSuccess) {
+    g_zslab.bytes = want;
+    fprintf(stderr, "[fa2_sm70] fold: плита %zu МБ готова\n", want >> 20);
+  } else {
+    g_zslab.base = nullptr;
+    fprintf(stderr, "[fa2_sm70] fold: плита %zu МБ НЕ выделена, откат\n", want >> 20);
+  }
+}
+
+// Возвращает тензор из плиты (ok=true) либо пустой тензор (ok=false -> обычный путь).
+at::Tensor fold_take_slot(int64_t m, int64_t n, const at::TensorOptions& options,
+                          bool& ok) {
+  ok = false;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return at::Tensor();
+
+  if (st != cudaStreamCaptureStatusActive) {
+    if (g_zslab.in_capture) {
+      fprintf(stderr, "[fa2_sm70] fold: захват закончен, слотов %d, откатов %lld\n",
+              g_zslab.call, g_zslab.fallback);
+    }
+    g_zslab.in_capture = false;
+    return at::Tensor();  // вне графа -- обычный путь
+  }
+
+  if (!g_zslab.in_capture) {  // НАЧАЛО нового захвата
+    g_zslab.in_capture = true;
+    g_zslab.bump = 0;
+    g_zslab.call = 0;
+  }
+  if (!g_zslab.base) return at::Tensor();
+
+  size_t need = ((size_t)m * (size_t)n * 2 + 511) & ~(size_t)511;
+  if (g_zslab.bump + need > g_zslab.bytes) {
+    g_zslab.fallback++;
+    return at::Tensor();
+  }
+  char* p = static_cast<char*>(g_zslab.base) + g_zslab.bump;
+  if (g_zslab.call == 0) {
+    // ОДИН узел графа вместо 236 заливок.
+    cudaMemsetAsync(g_zslab.base, 0, g_zslab.bytes, stream);
+  }
+  g_zslab.bump += need;
+  g_zslab.call++;
+  g_zslab.folded++;
+  ok = true;
+  return torch::from_blob(p, {m, n}, options);
+}
+
 }  // namespace gptq
 }  // namespace vllm
 
@@ -1831,7 +1942,49 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
                         bool use_exllama, bool use_v2_format, int64_t bit) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  at::Tensor c = torch::zeros({a.size(0), b_q_weight.size(1)}, options);
+  // [fa2_sm70] Allocate C zeroed ONLY where a zero start is actually required.
+  // See gptq_gemm_uses_reconstruct(): the reconstruct branch ends in cublasHgemm with
+  // beta = 0 (C write-only), the quantized branches accumulate into C with atomicAdd.
+  // Prefill (size_m = the chunk, thousands of rows) always takes the reconstruct branch,
+  // decode (size_m <= 24 at bit 8) always takes the atomicAdd one -- so this removes the
+  // dead fill from the prefill path without touching the path that needs it.
+  // VLLM_GPTQ_ZERO_C=1 restores the unconditional fill: an A/B switch inside ONE binary
+  // (and an escape hatch, should some future kernel start reading C).
+  // [fa2_sm70 / ПАРА-1] Режимы обнуления C. Значение VLLM_GPTQ_ZERO_C:
+  //   (не задано) / "0"  -- как было: пропустить обнуление ТОЛЬКО на пути reconstruct;
+  //   "1" (любое иное)   -- обнулять всегда (исходное поведение vLLM);
+  //   "never"            -- НИКОГДА не обнулять. ЧИСЛЕННО НЕВЕРНО на пути atomicAdd,
+  //                         это ФАЛЬСИФИКАТОР: снимает ровно 236 узлов графа на токен,
+  //                         не меняя ни одного байта прочей работы -> ПОТОЛОК выигрыша;
+  //   "fold"             -- ПАССАЖИР: C декодных умножений берётся из постоянной плиты,
+  //                         и вся плита зануляется ОДНИМ узлом cudaMemsetAsync на токен
+  //                         (236 ядер -> 1 узел). Работает только внутри захвата графа.
+  enum ZeroMode { ZM_DEFAULT, ZM_ALWAYS, ZM_NEVER, ZM_FOLD };
+  static const ZeroMode zmode = [] {
+    const char* e = std::getenv("VLLM_GPTQ_ZERO_C");
+    if (!e || !*e) return ZM_DEFAULT;
+    if (!std::strcmp(e, "never")) return ZM_NEVER;
+    if (!std::strcmp(e, "fold")) return ZM_FOLD;
+    if (*e == '0') return ZM_DEFAULT;
+    return ZM_ALWAYS;
+  }();
+
+  const bool uses_reconstruct = vllm::gptq::gptq_gemm_uses_reconstruct(
+      static_cast<int>(a.size(0)), use_exllama, static_cast<int>(bit));
+  bool no_zero_needed = (zmode != ZM_ALWAYS) && uses_reconstruct;
+  if (zmode == ZM_NEVER) no_zero_needed = true;
+
+  at::Tensor c;
+  bool c_ready = false;
+  if (zmode == ZM_FOLD) vllm::gptq::fold_maybe_init();
+  if (zmode == ZM_FOLD && !uses_reconstruct) {
+    c = vllm::gptq::fold_take_slot(a.size(0), b_q_weight.size(1), options, c_ready);
+  }
+  if (!c_ready) {
+    c = no_zero_needed
+            ? torch::empty({a.size(0), b_q_weight.size(1)}, options)
+            : torch::zeros({a.size(0), b_q_weight.size(1)}, options);
+  }
   at::Tensor temp_dq = torch::empty(
       {b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)}, options);
 

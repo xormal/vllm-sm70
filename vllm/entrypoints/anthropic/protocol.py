@@ -40,6 +40,7 @@ class AnthropicContentBlock(BaseModel):
     source: dict[str, Any] | None = None
     # For tool use/result
     id: str | None = None
+    tool_use_id: str | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
     content: str | list[dict[str, Any]] | None = None
@@ -92,6 +93,11 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+    min_p: float | None = None
+    min_tokens: int | None = None
+    ignore_eos: bool | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
 
     @field_validator("model")
     @classmethod

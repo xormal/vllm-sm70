@@ -308,7 +308,7 @@ flash_attention_forward_kernel(
             const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);
             const float old_max  = sRowMax[row];
             const float new_max  = fmaxf(old_max, row_max);
-            const float exp_diff = __expf(old_max - new_max);
+            const float exp_diff = expf(old_max - new_max);
 
             float thread_sum = 0.0f;
             __half2 half_buffer[20];
@@ -320,10 +320,10 @@ flash_attention_forward_kernel(
                 if (vc_base < vec_cols) {
                     float4 v4 = sS_vec4[vc_base];
 
-                    float e0 = __expf(fmaxf(v4.x - new_max, -80.0f));
-                    float e1 = __expf(fmaxf(v4.y - new_max, -80.0f));
-                    float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
-                    float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
+                    float e0 = expf(fmaxf(v4.x - new_max, -80.0f));
+                    float e1 = expf(fmaxf(v4.y - new_max, -80.0f));
+                    float e2 = expf(fmaxf(v4.z - new_max, -80.0f));
+                    float e3 = expf(fmaxf(v4.w - new_max, -80.0f));
 
                     thread_sum += (e0 + e1) + (e2 + e3);
 
@@ -335,7 +335,7 @@ flash_attention_forward_kernel(
             #pragma unroll 4
             for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
                 float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
-                float e = __expf(fmaxf(v - new_max, -80.0f));
+                float e = expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += (c < valid_k_rows) ? e : 0.0f;
                 sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
             }

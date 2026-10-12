@@ -354,4 +354,23 @@ def flash_attn_prefill_paged(
     return out_.permute(0, 2, 1, 3).contiguous()
 
 
-__all__ = ["flash_attn_func", "flash_attn_decode_paged", "flash_attn_prefill_paged"]
+def reshape_and_cache_fp8(
+    key: torch.Tensor,          # [num_tokens, num_heads, head_size] fp16
+    value: torch.Tensor,        # same
+    key_cache: torch.Tensor,    # [num_blocks, block_size, num_heads, head_size] uint8
+    value_cache: torch.Tensor,  # same
+    slot_mapping: torch.Tensor, # [num_tokens]
+    kv_cache_dtype: str,        # "fp8" / "fp8_e4m3" / "fp8_e5m2"
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+):
+    """Quantize+write K/V into the paged fp8 KV cache on SM70 (custom CUDA,
+    bypasses Triton which can't emit e4m3fn stores on Volta)."""
+    flash_attn_v100_cuda.reshape_and_cache_fp8(
+        key, value, key_cache, value_cache, slot_mapping,
+        kv_cache_dtype, float(k_scale), float(v_scale),
+    )
+
+
+__all__ = ["flash_attn_func", "flash_attn_decode_paged", "flash_attn_prefill_paged",
+           "reshape_and_cache_fp8"]

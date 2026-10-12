@@ -124,7 +124,45 @@ struct Sm70F16WeightCacheKeyHash {
 struct Sm70F16WeightCacheEntry {
   torch::Tensor tm_weight;
   int64_t k_ld;
+  // [fa2_sm70 patch] Ownership guard for `Sm70F16WeightCacheKey::tensor_impl`.
+  // The key is a raw `TensorImpl*` that this table does NOT own.  Without a guard the
+  // address is recycled by the very next tensor of the same shape, and the table then
+  // answers for a DIFFERENT weight -- silently, with identical metadata.
+  // A weak ref keeps the TensorImpl object (not its storage, ~200 B) allocated while an
+  // entry exists, so the address can never be reissued behind our back, and
+  // `expired()` reports that the source weight is gone.  `src_data` additionally
+  // catches `param.data = other` (same TensorImpl, different storage).
+  c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl> src_impl;
+  const void* src_data;
 };
+
+// [fa2_sm70 patch] Geometry the sm70 fp16 weight converter imposes, derived from the
+// SAME templates the converter itself instantiates (`GetConverters(kHalf, kHalf,
+// kHalf, true, 70)` selects `W(sm70, kRowMajor, s884h | B | _1)`), so these constants
+// cannot drift away from it.
+constexpr turbomind::gemm::Pack kSm70F16WeightPack =
+    static_cast<turbomind::gemm::Pack>(turbomind::gemm::HMMA_884) |
+    static_cast<turbomind::gemm::Pack>(turbomind::gemm::OPERAND_B) | 1u;
+
+using Sm70F16WeightPacking =
+    turbomind::gemm::Packing_v2<kSm70F16WeightPack, turbomind::gemm::kRowMajor>;
+
+// Output rows are packed in groups of this many; a remainder is DROPPED by the
+// integer division inside the packing, which is why N % 32 != 0 must be refused.
+constexpr int kSm70F16WeightRowPack = 32;
+static_assert(Sm70F16WeightPacking::apply({kSm70F16WeightRowPack, 1}).x == 1,
+              "sm70 fp16 weight row packing granularity changed");
+static_assert(Sm70F16WeightPacking::apply({kSm70F16WeightRowPack - 1, 1}).x == 0,
+              "sm70 fp16 weight row packing granularity changed");
+
+// The packed leading dimension `sm70_f16_prepare` returns and `sm70_f16_gemm_out`
+// must be handed back: `mk2cs<kRowMajor>(apply({n, k})).x` == k * 32.
+constexpr int64_t sm70_f16_expected_k_ld(int64_t k) {
+  return turbomind::gemm::mk2cs<turbomind::gemm::kRowMajor>(
+             Sm70F16WeightPacking::apply(
+                 {kSm70F16WeightRowPack, static_cast<int>(k)}))
+      .x;
+}
 
 // Per-stream workspace management to eliminate mutex contention
 struct StreamWorkspaceKey {
@@ -349,6 +387,19 @@ void validate_f16_weight(const torch::Tensor& weight,
   TORCH_CHECK(weight.scalar_type() == torch::kFloat16,
               op_name, ": weight must be float16.");
   TORCH_CHECK(weight.dim() == 2, op_name, ": weight must be 2D.");
+  // [fa2_sm70 patch] The geometry gate used to live ONLY in the Python caller
+  // (`process_weights_after_loading`), so a direct call with N not a multiple of 32
+  // -- e.g. `linear_attn.in_proj_ba` with N=48 at TP=2 -- was ACCEPTED and returned a
+  // wrong transform (measured relL2 0.59...1.26).  The packing drops the tail rows by
+  // integer division, so this is not a performance preference, it is correctness.
+  TORCH_CHECK(weight.size(0) % kSm70F16WeightRowPack == 0,
+              op_name, ": weight rows (N=", weight.size(0),
+              ") must be a multiple of ", kSm70F16WeightRowPack,
+              " -- the sm70 HMMA.884 B-operand layout packs output rows in groups of "
+              "that size and would silently drop the remainder.");
+  TORCH_CHECK(weight.size(1) % 16 == 0,
+              op_name, ": weight cols (K=", weight.size(1),
+              ") must be a multiple of 16.");
 }
 
 void validate_f16_input(const torch::Tensor& in_feats,
@@ -458,19 +509,49 @@ Sm70F16WeightCacheEntry prepare_sm70_f16_weight(torch::Tensor weight,
                       stream) == 0,
       "sm70_f16_prepare: weight conversion failed.");
 
-  return {std::move(tm_weight), static_cast<int64_t>(k_desc.ld)};
+  // [fa2_sm70 patch] Pin the invariant `sm70_f16_gemm_out` is allowed to rely on.
+  // If the converter layout ever changes, this fires HERE, at load time, instead of
+  // turning every later GEMM into a wrong answer.
+  TORCH_CHECK(static_cast<int64_t>(k_desc.ld) == sm70_f16_expected_k_ld(k),
+              "sm70_f16_prepare: converter produced ld=", k_desc.ld,
+              ", expected ", sm70_f16_expected_k_ld(k),
+              " -- the packed layout changed; sm70_f16_gemm_out's check must be "
+              "updated with it.");
+
+  return {std::move(tm_weight), static_cast<int64_t>(k_desc.ld),
+          c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>(
+              weight.getIntrusivePtr()),
+          weight.data_ptr()};
 }
 
 Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
                                                    cudaStream_t stream) {
-  weight = weight.contiguous();
+  // [fa2_sm70 patch] Only a tensor whose identity OUTLIVES this call may be memoised.
+  // A non-contiguous weight is converted through a temporary that dies with the call,
+  // so it is converted afresh every time rather than entered into the table under a
+  // key that is dead the moment it is written.  No shipped path is non-contiguous.
+  if (!weight.is_contiguous()) {
+    TORCH_CHECK(!is_stream_capturing(stream),
+                "sm70_f16_prepare: cache miss during CUDA graph capture.");
+    return prepare_sm70_f16_weight(weight.contiguous(), stream);
+  }
+
   const auto key = make_sm70_f16_weight_cache_key(weight);
+  const void* const src_data = weight.data_ptr();
 
   {
     std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
     auto it = sm70_f16_weight_cache.find(key);
     if (it != sm70_f16_weight_cache.end()) {
-      return it->second;
+      // [fa2_sm70 patch] A hit is only a hit if the entry still belongs to THIS
+      // weight.  `src_impl.expired()` means the weight it was built from is gone --
+      // handing the entry back would answer with a matrix the caller never passed
+      // (the measured symptom: relL2 = sqrt(2), identical k_ld and shapes, cured by
+      // re-preparing a clone).  Drop the corpse instead.
+      if (!it->second.src_impl.expired() && it->second.src_data == src_data) {
+        return it->second;
+      }
+      sm70_f16_weight_cache.erase(it);
     }
   }
 
@@ -480,7 +561,8 @@ Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
   auto entry = prepare_sm70_f16_weight(weight, stream);
 
   std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-  auto [it, _] = sm70_f16_weight_cache.emplace(key, entry);
+  auto [it, inserted] = sm70_f16_weight_cache.insert_or_assign(key, entry);
+  (void)inserted;
   return it->second;
 }
 
@@ -940,6 +1022,27 @@ void sm70_f16_gemm_out(torch::Tensor out,
 
   TORCH_CHECK(tm_weight.size(1) == k,
               "sm70_f16_gemm: weight shape mismatch.");
+  // [fa2_sm70 patch] This operator used to signal NOTHING: it took the packed weight
+  // and its leading dimension entirely on trust, so a caller that skipped the value
+  // check shipped garbage.  Everything about the pair that IS checkable is checked
+  // here.  What stays uncheckable is the CONTENT of an already-packed weight (it
+  // carries no provenance across the op boundary) -- that class is closed at its
+  // source, in the memo table above, not here.
+  TORCH_CHECK(n % kSm70F16WeightRowPack == 0,
+              "sm70_f16_gemm: weight rows (N=", n, ") must be a multiple of ",
+              kSm70F16WeightRowPack,
+              " -- a packed weight with a remainder is missing its tail rows.");
+  TORCH_CHECK(k % 16 == 0,
+              "sm70_f16_gemm: K=", k, " must be a multiple of 16.");
+  TORCH_CHECK(k_ld == sm70_f16_expected_k_ld(k),
+              "sm70_f16_gemm: k_ld=", k_ld, " does not belong to this weight; the "
+              "sm70 packed layout for K=", k, " has ld=", sm70_f16_expected_k_ld(k),
+              ". Pass the value sm70_f16_prepare returned FOR THIS weight.");
+  TORCH_CHECK(tm_weight.is_contiguous(),
+              "sm70_f16_gemm: packed weight must be contiguous.");
+  TORCH_CHECK(tm_weight.get_device() == device && out.get_device() == device,
+              "sm70_f16_gemm: out/input/weight must be on one device (got ",
+              out.get_device(), "/", device, "/", tm_weight.get_device(), ").");
   TORCH_CHECK(out.size(0) == m,
               "sm70_f16_gemm: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
