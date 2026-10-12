@@ -206,8 +206,11 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
 1. the working-tree changes the deployed binaries were built from (GPTQ/AWQ sm70 GEMM, flash-attention-v100 paged paths);
 2. the production Python runtime of vLLM (44 modified and 8 new modules);
 3. `sm70/`: kernels, integration layer, Clef runtime and vendored TurboMind headers;
-4. the launcher, the production lever set and the pinned environment;
-5. this documentation.
+4. the launcher, the production lever set and the pinned environment, plus the scripted source build;
+5. this documentation (English and Russian), lever reference and validation guide;
+6. removal of upstream vLLM CI workflows that do not apply to a standalone repository;
+7. fixes found by building and serving from a fresh clone: the build PATH, and the out-of-tree
+   TurboMind header needed by the tm8 extension.
 
 `git log 437b358e5..sm70` shows each step with a description.
 
