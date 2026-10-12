@@ -1,705 +1,223 @@
-# 1Cat-vLLM-0.0.3
+# vLLM-SM70
 
-> 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判“过时”。
-> `1Cat-vLLM-0.0.3` 不是一次简单的适配更新，而是一次面向
-> **SM70 / Tesla V100** 的系统性工程重构。我们围绕 AWQ、注意力后端、
-> 长上下文稳定性、运行时默认值和部署路径做了成体系的打磨，极大提升了
-> V100 的模型使用上限，让更多原本“难以跑起来、难以跑稳定、难以跑得快”
-> 的现代模型场景，真正变得可用、好用、能持续部署。
->
-> 在我们聚焦和验证过的 V100 场景里，这个版本不仅显著抬升了上下文能力与
-> 部署稳定性，也带来了业界领先的推理速度表现。对还在使用 V100 的个人开发者、
-> 工作室和团队来说，这意味着老卡依然有很强的生命力，依然值得被继续挖掘。
-> 我们真心希望 V100 开源社区越来越好，也希望把一猫之下自己的工程经验、
-> 优化成果和热情，实实在在地贡献给社区。感谢每一位关注、使用、反馈和支持
-> 一猫之下的朋友。你们的支持，是我们继续把这件事做深、做久、做好的动力。
+**The production vLLM stack for NVIDIA Volta (V100, `sm_70`).** It serves Qwen3.8-27B (GPTQ-Int8)
+with a 262,144-token context on two 32 GB cards, plus Cloudflare's Clef decision model on the same
+weights.
 
-`1Cat-vLLM-0.0.3` is a formal `0.0.3` release of the **Tesla V100 / SM70** vLLM fork for
-**AWQ 4-bit inference on Volta GPUs,and FlashAttn-2!!**.
+This repository is exactly the code that has served production traffic since 2026-10-12: the vLLM
+fork, the Volta kernel library and the integration layer, with the launcher and lever set of the
+running server. It is a fork of [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (a Volta-focused
+fork of [vllm-project/vllm](https://github.com/vllm-project/vllm)), branch `sm70`.
 
-Upstream vLLM AWQ kernels normally require **SM75+** in the default path.
-This branch integrates **lmdeploy TurboMind SM70 WMMA kernels**,
-**FLASH_ATTN_V100**, and a set of SM70-specific runtime fixes so that V100 can
-serve modern AWQ models, especially **Qwen3.5 / Qwen3.6 dense and MoE models**.
+| | |
+|---|---|
+| **Model** | [Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef](https://huggingface.co/xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef) ¹ (int8 GPTQ of [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-BF16), base [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) + adapters for [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) |
+| **Hardware** | 2× NVIDIA V100 32 GB, tensor parallel 2, NVLink or PCIe |
+| **Context** | 262,144 tokens, int8 KV cache |
+| **Modalities** | text, images, video, tool calls (OpenAI-compatible API) |
+| **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, +0.29 / +0.12 GB of GPU memory |
+| **Speculation** | native MTP head, k = 3, with n-gram assist |
 
-Compared with the earlier `0.0.2` line, `0.0.3` focuses on the new V100
-attention backend, Qwen3.5/Qwen3.6 model coverage, and a cleaner public wheel
-installation path. The validated default path now centers on
-`FLASH_ATTN_V100` instead of the older Triton attention fallback.
+¹ Intended public locations of the model and this repository. Until they are published the links may not resolve.
 
-## Recommended model providers
+---
 
-- `tclf90/Qwen3.6-27B-AWQ`
-- `tclf90/Qwen3.6-35B-A3B-AWQ`
-- `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
+## Why
 
-The launch commands below use short model names such as
-`Qwen3.5-27B-AWQ` and `Qwen3.6-35B-A3B-AWQ`.
+Modern attention kernels (FlashAttention ≥ 2 targets `sm_80+`, FlashInfer `sm_75+`) and most quantized
+GEMM paths do not run on Volta. Upstream vLLM on a V100 is therefore slow, short-context, or does not start at
+all for hybrid models such as Qwen3.5/3.8 (Gated DeltaNet + full attention). This stack closes the gap
+with its own kernels and integration:
 
-This assumes one of the following is true:
+* **Attention:** CUTLASS-based FMHA prefill, sparse prefill with a measured error bound, split-K
+  paged decode with an int8 KV cache, and a virtual-batch path for speculative positions. All kernels are
+  verified against fp32 exact-softmax oracles.
+* **Linear layers:** GPTQ-int8 GEMV on tensor cores for decode, turbomind s884 int8 GEMM and
+  cuBLAS-reconstruct for prefill, 12-bit (W12) attention projections, and an int8 `lm_head`.
+* **Hybrid model plumbing:** int16 Gated DeltaNet state pools, split KV pools, block sizes aligned for 262K
+  on 64 GB of total GPU memory, and shared GDN metadata across groups.
+* **Speculation:** the model's own MTP head (int8, own CUDA graph, int4-sliced vocabulary argmax), with
+  n-gram proposals when they out-accept it.
+* **Clef on the same weights:** per-row low-rank weight correction inside the int8 GEMM kernels plus a native
+  CUDA joint schema head. Clef requests get Clef's weights, chat requests in the same batch are untouched,
+  and no second model is loaded.
 
-- you have local model directories with exactly these names
-- you replace `--model` with your real local path
-- you replace `--model` with the full Hugging Face repo id
+## Measured on the reference deployment
 
-## What this branch adds
+| | |
+|---|---|
+| 250K-token prefill | 186.8 s (2026-09-15), median 215 s (2026-09-23), NVLink pair; depends on card temperature |
+| Decode, single stream | 55.8 / 58.4 / 48.6 tok/s at 32K / 128K / 250K on filler, 63.8 tok/s on natural text (MTP k=3) |
+| Long-context retrieval | code word at the start of a 243,173-token prompt reproduced verbatim (2026-10-12) |
+| Clef vs the original Clef in fp16 | 35/35 decisions, max \|Δp\| 0.0093 on 10 records of 152–16,384 tokens |
+| Load | 10 Clef records + 6 chats concurrently, and 8 × 2-image storms followed by a 243K prompt: no failures |
 
-- AWQ 4-bit support for **SM70 / Tesla V100**
-- Dense and MoE AWQ execution paths on V100
-- Reuse of SM70 AWQ kernels for selected compressed-tensors MoE paths
-- `FLASH_ATTN_V100` decode and prefill backend for Volta GPUs
-- Qwen3.5 / Qwen3.6 model and config support, including MoE and MTP paths
-- SM70-specific MLA/GDN runtime fixes
-- Compatibility with `torch.compile` and CUDA graphs
-- OpenAI-compatible API serving through standard vLLM entrypoints
+Details, tools and known effects: [docs/sm70/VALIDATION.md](docs/sm70/VALIDATION.md).
 
-## What is new in 0.0.3
+## Requirements
 
-- A release step forward over `0.0.2` for **V100-flash-attention**, Qwen3.5/Qwen3.6
-  coverage, and public packaging
-- A **two-wheel** installation path for `Python 3.12 + CUDA 12.8`
-  (`flash_attn_v100` plus `vllm`)
-- Public runtime defaults now center on:
-  - `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
-  - `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-  - `--max-model-len 262144`
-  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
-- V100 `32 GB` reference configs for 4-card systems:
-  - `Qwen3.5-27B-AWQ`
-  - `Qwen3.6-35B-A3B-AWQ`
-  - `Qwen3.5-122B-A10B-AWQ`
-- Long-prompt chunk budget for `FLASH_ATTN_V100` on 32 GB V100 defaults to
-  `max_num_batched_tokens=16384`
-- Direct paged prefill remains experimental and is not the public default
+* 2× NVIDIA V100 32 GB (tested: one NVLink pair and one PCIe pair), driver supporting CUDA 12.8 (tested 580).
+* CUDA **12.8** toolkit (`nvcc`) and a host gcc it accepts (tested gcc 11.4). The sm70 kernels are JIT-compiled.
+* Python **3.12**, ≥ 32 GB RAM for the build with `MAX_JOBS=8` (~3 GB per job), ~35 GB disk for the model, ~2 GB for build products.
 
-## Reference hardware platforms
-
-`0.0.3` is validated primarily on 4-card V100 systems. The recommended public
-commands below assume **4 x V100 32 GB** and text-generation workloads.
-
-| Public reference host | Notes |
-| --- | --- |
-| 4 x Tesla PG503 / V100 32 GB | Recommended target for Qwen3.5/Qwen3.6 AWQ serving |
-
-- `Qwen3.5-27B-AWQ`: supported on TP1/TP2/TP4, with TP4 recommended for this README
-- `Qwen3.6-35B-A3B-AWQ`: TP4 recommended for the public command
-- `Qwen3.5-122B-A10B-AWQ`: TP4 only in the public command
-
-## Benchmarks / Effort figures
-
-The following local `0.0.3` regression charts were generated on a 4-card V100
-32 GB system. First-request warmup is not included as steady-state throughput.
-
-### Local test charts
-
-| `Qwen3.5-27B-AWQ` | `Qwen3.6-35B-A3B-AWQ` | `Qwen3.5-122B-A10B-AWQ` |
-| --- | --- | --- |
-| [![Qwen3.5-27B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-27B-AWQ,20260501_001139.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-27B-AWQ,20260501_001139.png) | [![Qwen3.6-35B-A3B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.6-35B-A3B-AWQ,20260501_002046.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.6-35B-A3B-AWQ,20260501_002046.png) | [![Qwen3.5-122B-A10B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-122B-A10B-AWQ,20260501_004543.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-122B-A10B-AWQ,20260501_004543.png) |
-
-- first-request warmup on V100 is slow and is not representative
-- long-context throughput depends strongly on `TP`, `max_num_seqs`, and the
-  attention backend
-- the public runtime defaults in this README prioritize stable serving over
-  peak single-case benchmark numbers
-
-### Reproducible 27B decode baseline
-
-The `0.0.3` 27B speed baseline is measured as **incremental decode TPS**:
-
-```text
-incremental_decode_tps =
-  (decode64_output_tokens - decode1_output_tokens) /
-  (decode64_median_latency - decode1_median_latency)
-```
-
-This removes prefill/TTFT from the measurement. It is stricter than API
-streaming throughput and should not be compared directly with browser-side
-OpenAI streaming numbers.
-
-Reference result on `4 x Tesla PG503 / V100 32 GB`:
-
-| Model | Backend | TP | Custom all-reduce | Short-context incremental decode | 8K-context incremental decode |
-| --- | --- | ---: | --- | ---: | ---: |
-| `Qwen3.5-27B-AWQ` | `FLASH_ATTN_V100` | 4 | enabled | `86.31 tok/s` | `79.04 tok/s` |
-
-Strict reproduction command. This speed-only harness intentionally keeps
-`max_model_len=12288` to match the historical model-side regression test. The
-public serving commands below default to 256K context with
-`max_model_len=262144`.
+## Installation
 
 ```bash
-export ONECAT_VLLM_REPO=/path/to/1Cat-vLLM-0.0.3/vllm
-cd /tmp
-
-CUDA_DEVICE_ORDER=PCI_BUS_ID \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-HF_HUB_OFFLINE=1 \
-TRANSFORMERS_OFFLINE=1 \
-VLLM_USE_V1=1 \
-VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1 \
-python "$ONECAT_VLLM_REPO/tools/vllm_v100_backend_regression.py" \
-  --child \
-  --backend FLASH_ATTN_V100 \
-  --model /home/ymzx/models/Qwen3.5-27B-AWQ \
-  --dtype float16 \
-  --kv-cache-dtype auto \
-  --max-model-len 12288 \
-  --max-num-seqs 8 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-auto-trim-ratio 1.05 \
-  --tensor-parallel-size 4 \
-  --prompt-style qwen35-chat \
-  --disable-thinking \
-  --disable-mm \
-  --quality-max-tokens 1 \
-  --long-prompt-tokens 8202 \
-  --speed-warmup 3 \
-  --speed-iters 5 \
-  --skip-quality \
-  --child-output /tmp/qwen35_27b_fa2_baseline.json
+git clone -b sm70 https://github.com/xormal/vllm-sm70.git
+cd vllm-sm70
+CUDA_HOME=/usr/local/cuda-12.8 MAX_JOBS=8 scripts/install_from_source.sh
 ```
 
-Expected key latencies:
+[`scripts/install_from_source.sh`](scripts/install_from_source.sh) creates `.venv` with the exact package
+versions of the deployment ([`requirements-sm70.txt`](requirements-sm70.txt): torch 2.9.1+cu128,
+transformers 4.57.6, triton 3.5.1, …). It then builds `flash-attention-v100` and vLLM for `sm_70`. The vLLM
+build takes about an hour with `MAX_JOBS=8`. If your pip configuration adds unreachable indexes, run it
+with `PIP_CONFIG_FILE=/dev/null`.
 
-- `batch1_prefill512_decode1`: about `0.179 s`
-- `batch1_prefill512_decode64`: about `0.909 s`
-- incremental decode: about `86 tok/s`
-
-Do **not** add `--disable-custom-all-reduce` for the 27B TP4 baseline. On the
-same hardware this drops short-context incremental decode from about
-`86.31 tok/s` to about `75.91 tok/s`.
-
-## 微信交流群
-
-**群聊：** 1Cat-vLLM 开源交流群2
-
-请使用微信扫描下方二维码加入群组：
-
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr.png)
-
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
-
-## Validated stack
-
-The commands in this README were validated on the following setup:
-
-- OS: `Ubuntu 24.04.4 LTS`
-- Python: `3.12.13`
-- CUDA toolkit: `12.8`
-- PyTorch: `2.9.1+cu128`
-- Triton: `3.5.1`
-- Driver: `570.211.01`
-- GPU: `4 x Tesla V100 32 GB` public reference profile
-
-The public launch commands below are written for 4-card V100 32 GB systems.
-
-## Runtime notes you should read first
-
-- The **first real request is not representative** of steady-state speed.
-  On V100, the first request may spend **1 to 3 minutes** compiling kernels,
-  building graphs, and warming up execution paths.
-- The public commands in this README are text-generation profiles. Vision or
-  multimodal workloads should be tuned separately.
-- For Qwen3.5/Qwen3.6 text-only serving on V100 32 GB, the recommended public
-  defaults are:
-  - `--skip-mm-profiling`
-  - `--max-model-len 262144`
-  - `--kv-cache-auto-trim-ratio 1.05`
-  - `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
-  - `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
-- `--gpu-memory-utilization` is an upper bound for the model executor. By
-  default, 1Cat-vLLM trims the final KV cache allocation to about
-  `1.05 * max_model_len * max_num_seqs`, so single-request 256K serving does
-  not preallocate KV capacity for many extra full-length requests. Set
-  `--kv-cache-auto-trim-ratio 0` to keep upstream vLLM's "use all requested
-  memory for KV cache" behavior, or use `--kv-cache-memory-bytes` for an exact
-  per-GPU KV cache size.
-- `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is experimental. Keep it disabled for
-  the public 35B/122B MoE commands.
-- Direct paged prefill can be forced with `VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1`,
-  but it is not the quality-safe default.
-
-## Quick start
-
-### 1. Install CUDA 12.8
-
-Use the official NVIDIA repository on Ubuntu 24.04:
+## Serving
 
 ```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-8
+huggingface-cli download xormal/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
+    --local-dir /models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef
+
+PY=.venv/bin/python MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef \
+CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
-If the machine also has CUDA 13.x installed, force build-time and runtime CUDA
-to 12.8:
+[`scripts/serve_qwen38_clef.sh`](scripts/serve_qwen38_clef.sh) reproduces the production server exactly:
+it loads the 98 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
+toolchain, chooses fp16 or int12 all-reduce from the NVLink topology, refuses busy GPUs or ports, builds
+all kernels in one process, and starts the OpenAI-compatible server with the production arguments. The first
+start compiles the kernels (15–30 min) and repacks the attention weights to W12. Both are cached in
+`STATE_DIR` (default `~/.cache/vllm-sm70`), and later starts take a few minutes.
+
+| Variable | Default | |
+|---|---|---|
+| `MODEL_DIR` | required | checkpoint directory; Clef adapters are read from `MODEL_DIR/clef` |
+| `CARDS` | `0,1` | the two GPUs (nvidia-smi indices) |
+| `HOST`, `PORT` | `0.0.0.0`, `8000` | listen address |
+| `SERVED_NAMES` | `Qwen3.8-27B-ABLITERATED` | model names in the API |
+| `THINK` | `false` | default `enable_thinking` (per-request override allowed) |
+| `FA2SM70_CLEF` | `1` | `0` serves the base model only |
+| `STATE_DIR`, `PY`, `CUDA_HOME` | see script | cache directory, Python, toolkit |
+| `DRYRUN=1` | | print the resolved environment and command without starting |
+
+### Chat, vision, tools
+
+The standard OpenAI-compatible endpoints: `/v1/chat/completions` (text and images up to 20 per request,
+video up to 2), `/v1/completions`, `/v1/responses`, tool calling (`qwen3_coder` parser) and reasoning
+(`qwen3` parser).
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-hash -r
-nvcc -V
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "Qwen3.8-27B-ABLITERATED",
+  "messages": [{"role": "user", "content": "Explain warp divergence in one paragraph."}]}'
 ```
 
-### 2. Create the conda environment
+### Decisions: `POST /v1/systemone` (Clef)
 
 ```bash
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda create -y -n 1Cat-vLLM-0.0.3 python=3.12
-conda activate 1Cat-vLLM-0.0.3
-
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "clef",
+  "state": "Our checkout started returning errors and orders are blocked.",
+  "questions": {
+    "department": {"type": "choice", "instructions": "Which team should handle the message?",
+                   "criteria": {"billing": "Payments or invoices", "technical": "Bugs or outages"}},
+    "urgency":    {"type": "score", "criteria": ["Can wait", "This week", "Today"]},
+    "outage":     {"type": "noul", "instructions": "Is a service down?"}}}'
 ```
 
-### 3. Recommended install path: prebuilt wheel
-
-Use the release wheel if you only want to run the project.
-
-Install from a local wheel file:
-
-```bash
-python -m pip install \
-  ./dist-cu128-sm70-0.0.3/flash_attn_v100-*.whl \
-  ./dist-cu128-sm70-0.0.3/vllm-*.whl
+```json
+{"model": "clef", "answers": {
+  "department": {"type": "choice", "choice": "technical", "confidence": 0.9185,
+                 "probabilities": {"billing": 0.0815, "technical": 0.9185}},
+  "urgency":    {"type": "score", "score": 1.8064, "confidence": 0.8546,
+                 "legend": {"0": "Can wait", "1": "This week", "2": "Today"},
+                 "probabilities": {"0": 0.0482, "1": 0.0972, "2": 0.8546}},
+  "outage":     {"type": "noul", "noul": 0.8999}},
+ "usage": {"input_tokens": 300, "output_tokens": 0}}
 ```
 
-Or install from a GitHub release asset:
+* **Question types:** `choice` (dict of options → `choice`, `probabilities`), `score` (ordered list →
+  expected `score`, `probabilities`), `noul` (→ probability of "yes"). `state` is a string or any JSON value.
+* **Limits:** 16,384 tokens per record (Clef's own default `max_length`; lower it per request with
+  `"max_length"`), 64 questions, 448 options in total, 256 options per question. Two records are processed
+  concurrently and further ones wait.
+* **How it works.** The record is encoded with Clef's template and runs as a one-token prefill. For its
+  rows only, the int8 GEMM kernels add `deabl` (rank 1, layers 2–63) and Clef's exact rank-256 LoRA (layers
+  40–63, streamed from pinned host memory), which turns the served weights into Clef's. The final hidden
+  states are tapped into Clef's joint schema head, a native CUDA implementation. Clef requests use their
+  own `cache_salt` and never read the prefix cache. Code: [`sm70/integrations/vllm_sm70/fa2sm70_clef.py`](sm70/integrations/vllm_sm70/fa2sm70_clef.py),
+  [`sm70/fa2_sm70/csrc/clef.cu`](sm70/fa2_sm70/csrc/clef.cu).
 
-```bash
-python -m pip install \
-  "https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.3/flash_attn_v100-26.2-cp312-cp312-linux_x86_64.whl" \
-  "https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.3/vllm-0.0.3.dev0+g72bb24e2d.d20260430.cu128-cp312-cp312-linux_x86_64.whl"
+## Configuration
+
+The deployment is driven by environment levers. [docs/sm70/LEVERS.md](docs/sm70/LEVERS.md) explains the
+ones that change computation or memory, and [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env)
+holds all of them with production values. Change one at a time and re-run the gates.
+
+## Repository layout
+
+```
+vllm/                     vLLM 0.0.3 (1Cat-vLLM) + the production Python runtime:
+  v1/attention/backends/fa2_sm70.py      Volta attention backend (FA2_SM70)
+  v1/attention/backends/gdn_attn.py, model_executor/layers/fla/   Gated DeltaNet path
+  v1/spec_decode/                        MTP (eagle.py), DFlash/DFlash2 drafters, n-gram assist
+  v1/core/, v1/kv_cache_interface.py     split KV pools, hybrid block alignment
+  v1/worker/gpu_model_runner.py          memory trimming, step phases, Clef hook points
+csrc/, flash-attention-v100/, lmdeploy/  1Cat-vLLM C++/CUDA (GPTQ/AWQ sm70 GEMM, FA-V100, TurboMind)
+sm70/                     Volta kernel library and integration layer (MIT)
+  fa2_sm70/               JIT CUDA extensions (prefill, decode, GDN, W8/W12/tm8, exchange, Clef, ...)
+  fa2_src/                bundled CUTLASS headers (BSD-3-Clause) and Volta FMHA primitives
+  third_party/turbomind/  TurboMind GEMM headers used by the tm8 extension (Apache-2.0)
+  integrations/vllm_sm70/ runtime layer loaded via sitecustomize: linear paths, all-reduce, MTP head,
+                          flash_attn_v100 shim, Clef (fa2sm70_clef*.py, clef/), quantize/
+  docs/, tests/, benchmarks/   kernel documentation and oracle tests; see sm70/README.md
+scripts/                  install_from_source.sh, serve_qwen38_clef.sh
+configs/                  production lever set
+docs/sm70/                LEVERS.md, VALIDATION.md
+docs/upstream/            the original 1Cat-vLLM README
 ```
 
-Notes:
-
-- This is the **recommended** installation path for public users.
-- `flash_attn_v100` is a separate wheel and should be installed together with
-  the vLLM wheel.
-- Runtime installation from the wheels does not require the `lmdeploy` source
-  tree.
-- Use `Python 3.12` and `CUDA 12.8`.
-- After installing from wheels, run `python -m vllm...` from a directory outside
-  this source checkout, such as `cd ~` or `cd /tmp`. Running inside the cloned
-  repository makes Python import the local `vllm/` source tree, which does not
-  contain the wheel-installed CUDA extension files such as `vllm/_C.abi3.so`.
-
-### 4. Verify the environment
-
-```bash
-python - <<'PY'
-import torch, triton, vllm, sys
-import flash_attn_v100_cuda, paged_kv_utils
-print("python", sys.version.split()[0])
-print("torch", torch.__version__)
-print("torch_cuda", torch.version.cuda)
-print("triton", triton.__version__)
-print("vllm", vllm.__version__)
-print("flash_attn_v100", "ok")
-PY
-```
-
-## Docker deployment
-
-Docker deployment follows the same wheel-first approach. This release candidate
-does not include a dedicated `0.0.3` wheel-runtime Dockerfile yet, so use the
-conda wheel path above for final local validation.
-
-### 1. Build the recommended SM70 runtime image
-
-```bash
-# No dedicated 0.0.3 wheel-runtime Dockerfile is included in this tree yet.
-# Use the conda wheel install path above, or adapt docker/Dockerfile for source build.
-```
-
-The first Docker build will download several gigabytes of PyTorch and CUDA
-runtime layers. The build context for this repository is already trimmed, but
-the Docker image store still lives under the host Docker root directory unless
-you have moved it yourself.
-
-This Dockerfile intentionally uses `python:3.12-slim-trixie`. The current
-SM70 wheel needs `glibc >= 2.38`, and the runtime image also keeps `gcc/g++`
-installed because Triton compiles a small helper module on first startup.
-
-This image is pinned to:
-
-- `Python 3.12`
-- `Debian trixie / glibc 2.41`
-- `torch 2.9.1`
-- `torchvision 0.24.1`
-- `torchaudio 2.9.1`
-- `gcc/g++` for Triton first-run compilation
-- the current `v0.0.3` release wheel
-
-The runtime entrypoint should include these public defaults:
-
-- `--skip-mm-profiling`
-- `--max-model-len 262144`
-- `--kv-cache-auto-trim-ratio 1.05`
-- `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
-- `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
-
-If you want runtime caches to stay on a large disk, add these options to the
-`docker run` commands below:
-
-- `-v /path/to/1t-cache/hf:/cache/hf -e HF_HOME=/cache/hf`
-- `-v /path/to/1t-cache/triton:/cache/triton -e TRITON_CACHE_DIR=/cache/triton`
-- `-v /path/to/1t-cache/torchinductor:/cache/torchinductor -e TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor`
-- `-v /path/to/1t-cache/tmp:/cache/tmp -e TMPDIR=/cache/tmp`
-
-Final Docker validation data will be added after the wheel-runtime image is
-rebuilt for `0.0.3`.
-
-### 2. Run on four `32 GB` V100 with `Qwen3.5-27B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1 \
-  -e VLLM_MODEL=/models/Qwen3.5-27B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=16384 \
-  1cat-vllm-sm70:0.0.3
-```
-
-### 3. Run on four `32 GB` V100 with `Qwen3.6-35B-A3B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1 \
-  -e VLLM_MODEL=/models/Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8192 \
-  1cat-vllm-sm70:0.0.3
-```
-
-### 4. Run on four `32 GB` V100 with `Qwen3.5-122B-A10B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1 \
-  -e VLLM_MODEL=/models/Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8096 \
-  1cat-vllm-sm70:0.0.3
-```
-
-### 5. Quick API check
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3.5-27B-AWQ",
-    "messages": [{"role": "user", "content": "只回答最终结果：2+2等于几？"}],
-    "temperature": 0,
-    "max_completion_tokens": 16,
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
-
-### 6. Container source build
-
-Container source build is still available through the upstream-style
-multi-stage [`docker/Dockerfile`](docker/Dockerfile), but it is not the
-recommended first path for public users.
-
-For this fork, the recommended public Docker path is still the released wheel
-image above.
-
-## Source build
-
-Source build is still supported, but it is **not** the recommended first
-install path for public users.
-
-Only use it if:
-
-- you want to modify CUDA or Triton code
-- you want to rebuild your own wheel
-- you are doing development on this fork
-
-### 1. Bundled `lmdeploy` source dependency
-
-This repository already includes the validated `lmdeploy` source tree needed
-for the SM70 AWQ build path.
-
-```bash
-cd /path/to/vllm
-test -d lmdeploy
-```
-
-### 2. Install build dependencies
-
-```bash
-cd /path/to/vllm
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-0.0.3
-
-python -m pip install -r requirements/build.txt
-python -m pip install -r requirements/cuda.txt
-python -m pip install -r requirements/common.txt
-python -m pip install cmake build
-```
-
-### 3. Build from source
-
-The current validated `0.0.3` source build uses `CUDA 12.8`, `SM70`, and
-`MAX_JOBS=12`.
-
-```bash
-cd /path/to/vllm
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-0.0.3
-
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-export TORCH_CUDA_ARCH_LIST="7.0"
-export MAX_JOBS=12
-export NVCC_THREADS=1
-
-rm -rf build vllm.egg-info
-rm -rf .deps/*-build .deps/*-subbuild
-
-pushd flash-attention-v100
-python -m build --wheel --no-isolation --outdir ../dist-cu128-sm70-0.0.3
-popd
-
-export VLLM_VERSION_OVERRIDE="0.0.3.dev0+g72bb24e2d.d20260430.cu128"
-python -m build --wheel --no-isolation --outdir dist-cu128-sm70-0.0.3
-```
-
-If you want an editable source install instead of a wheel build:
-
-```bash
-python -m pip install -e . --no-build-isolation
-```
-
-## Public runtime defaults for V100 32 GB reference systems
-
-These are the public `0.0.3` reference configs we recommend writing into
-deployment docs.
-
-| Host | Model | TP | `max_model_len` | `max_num_seqs` | `max_num_batched_tokens` | Use case |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| 4-card `32 GB` V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
-| 4-card `32 GB` V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
-| 4-card `32 GB` V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
-
-Important wording:
-
-- `FLASH_ATTN_V100` is the recommended attention backend for V100 in `0.0.3`.
-- Public baseline launch commands in this README default to 256K context
-  (`max_model_len=262144`). If you publish or compare a new baseline, add its
-  exact launch command to this README.
-- Keep `max_num_seqs=1` for the public commands until your workload has been
-  profiled locally.
-- On 32 GB V100 with `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`, the API server
-  default is also capped at `max_num_seqs=1` to avoid upstream's high-concurrency
-  default preallocating unnecessary KV cache and sampler/CUDAGraph buffers.
-- Do not pass `--disable-custom-all-reduce` for the 27B TP4 decode baseline.
-- `122B` uses a small prefill chunk budget to leave room for SM70 MoE
-  temporary workspace during long-context serving.
-- `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is not recommended for the 35B/122B
-  MoE public commands.
-
-## Launch examples
-
-All commands below are written as full runnable commands. When using the
-prebuilt wheels, run them outside the source checkout, for example after
-`cd ~`, so Python loads the installed wheel package and its CUDA extensions.
-
-### Common V100 environment
-
-```bash
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100
-export VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1
-```
-
-### Qwen3.5-27B-AWQ, TP4, public 4-card default
-
-```bash
-source /home/ymzx/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-0.0.3
-
-python -m vllm.entrypoints.openai.api_server \
-  --model /home/ymzx/models/Qwen3.5-27B-AWQ \
-  --served-model-name Qwen3.5-27B-AWQ \
-  --trust-remote-code \
-  --quantization awq \
-  --dtype float16 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-auto-trim-ratio 1.05 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 16384 \
-  --skip-mm-profiling \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --generation-config vllm \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-### Qwen3.6-35B-A3B-AWQ, TP4, public 4-card default
-
-```bash
-source /home/ymzx/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-0.0.3
-
-python -m vllm.entrypoints.openai.api_server \
-  --model /home/ymzx/models/Qwen3.6-35B-A3B-AWQ \
-  --served-model-name Qwen3.6-35B-A3B-AWQ \
-  --trust-remote-code \
-  --quantization awq \
-  --dtype float16 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-auto-trim-ratio 1.05 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 8192 \
-  --skip-mm-profiling \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --generation-config vllm \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-### Qwen3.5-122B-A10B-AWQ, TP4, long-context 4-card default
-
-```bash
-source /home/ymzx/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-0.0.3
-
-python -m vllm.entrypoints.openai.api_server \
-  --model /home/ymzx/models/Qwen3.5-122B-A10B-AWQ \
-  --served-model-name Qwen3.5-122B-A10B-AWQ \
-  --trust-remote-code \
-  --quantization awq \
-  --dtype float16 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-auto-trim-ratio 1.05 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 8096 \
-  --skip-mm-profiling \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --generation-config vllm \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-## OpenAI-compatible request example
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer EMPTY' \
-  -d '{
-    "model": "Qwen3.5-27B-AWQ",
-    "messages": [{"role": "user", "content": "用一句话回答，2+2等于几？"}],
-    "temperature": 0,
-    "max_completion_tokens": 32,
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
-
-If the first request returns `2+2 等于 4。`, the service is basically healthy.
-
-## Optional experimental feature: FP8 KV cache
-
-This is not the default public recommendation, but it is worth documenting.
-
-- `fp8_e4m3` is not usable on V100 in the current Triton path
-- `fp8_e5m2` can be used experimentally
-- do **not** add `--calculate-kv-scales`
-
-Example:
-
-```bash
---kv-cache-dtype fp8_e5m2
-```
-
-## Known limits
-
-- This branch is optimized for **SM70 / Tesla V100**, not for all hardware.
-- Public launch commands default to 256K context with
-  `max_model_len=262144`.
-- The public 27B command keeps `max_num_batched_tokens=16384`.
-- The public 35B and 122B commands use smaller prefill chunk budgets to leave
-  room for MoE and long-context workspace.
-- Multimodal and vision workloads are not the default public profile for this
-  release.
-- If you want guaranteed headroom for very long prompts, keep
-  `--max-num-seqs 1` before increasing any other knob.
-
-## Repository notes
-
-- The upstream project is **vLLM**
-- This fork focuses on **SM70 AWQ support and V100-oriented runtime tuning**
-- The public `0.0.3` README prioritizes:
-  - prebuilt wheel installation
-  - short model names in commands
-  - `FLASH_ATTN_V100` as the recommended V100 attention backend
-  - full runnable `python -m vllm.entrypoints.openai.api_server` commands
-
-## Acknowledgements
-
-- [vLLM](https://github.com/vllm-project/vllm)
-- [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
+The kernel library has its own documentation: [sm70/README.md](sm70/README.md) and
+[sm70/docs/KERNELS.md](sm70/docs/KERNELS.md). Many code comments in `sm70/` and in the runtime files are
+engineering notes in Russian. They record the measurement behind each decision.
+
+## Changes relative to 1Cat-vLLM
+
+The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
+
+1. the working-tree changes the deployed binaries were built from (GPTQ/AWQ sm70 GEMM, flash-attention-v100 paged paths);
+2. the production Python runtime of vLLM (44 modified and 8 new modules);
+3. `sm70/`: kernels, integration layer, Clef runtime and vendored TurboMind headers;
+4. the launcher, the production lever set and the pinned environment;
+5. this documentation.
+
+`git log 437b358e5..sm70` shows each step with a description.
+
+## Known limitations
+
+* Volta only. Other architectures are untested, and some paths assume `sm_70`.
+* `/v1/completions` with `echo` and `logprobs` on long prompts allocates full-vocabulary logits per
+  prompt chunk (1.89 GiB per rank) and can exhaust memory. Do not expose prompt logprobs to untrusted
+  clients.
+* With speculation, decode logprobs depend at the ~1e-3 level on the GPU memory layout at startup
+  (see VALIDATION.md). Bitwise comparisons are only meaningful between identical configurations.
+* Clef records are limited to 16,384 tokens by default. The native head is verified to 32,768, but Clef's
+  behavior beyond 16K was not evaluated.
 
 ## License
 
-This repository follows the upstream vLLM license model. See [LICENSE](LICENSE).
+* vLLM and 1Cat-vLLM code (everything outside `sm70/`): Apache License 2.0, see [LICENSE](LICENSE).
+* `sm70/`: MIT, see [sm70/LICENSE](sm70/LICENSE), except the vendored third-party code:
+  CUTLASS in `sm70/fa2_src/cutlass` (BSD-3-Clause, see its `LICENSE.txt`) and TurboMind headers in
+  `sm70/third_party/turbomind` (Apache-2.0, see its `LICENSE`).
+* Model weights are distributed separately under Apache-2.0 (see the model card).
+
+## Acknowledgements
+
+[vLLM](https://github.com/vllm-project/vllm), [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) by 1Cat AI,
+[CUTLASS](https://github.com/NVIDIA/cutlass), [LMDeploy/TurboMind](https://github.com/InternLM/lmdeploy),
+[flash-linear-attention](https://github.com/fla-org/flash-linear-attention) (vendored in vLLM), the
+[Qwen](https://huggingface.co/Qwen) team, [Blackfrost](https://huggingface.co/Blackfrost-AI), and
+[Cloudflare](https://huggingface.co/Cloudflare/clef) for Clef.
