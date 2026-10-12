@@ -340,6 +340,22 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                     cache_config.mamba_cache_mode,
                     model_config.architecture,
                 )
+            # [FA2/SM70, задача 194] РЕЖИМ 'all' ВКЛЮЧАЕТСЯ РЫЧАГОМ, А НЕ САМ.
+            # Реализация есть (состояние GDN по границам блоков), но это РАЗМЕН: 'all'
+            # держит страницы под ВСЕ 64 слоя, а не под 16 слоёв внимания, и при том же пуле
+            # ёмкость контекста падает ~392K -> ~98K токенов. Для диалога это выгодно (кэш
+            # работает вместе со спекуляцией), для длинных промптов -- нет. Пока рычаг не
+            # выставлен, поведение боевого прежнее.
+            import os as _os
+            if (
+                cache_config.mamba_cache_mode == "all"
+                and _os.environ.get("FA2SM70_MAMBA_ALL", "0") != "1"
+            ):
+                cache_config.mamba_cache_mode = "align"
+                logger.warning(
+                    "[fa2_sm70] режим mamba-кэша 'all' СОБРАН, но выключен: "
+                    "включение -- FA2SM70_MAMBA_ALL=1 (цена -- ёмкость контекста)"
+                )
             if (
                 cache_config.mamba_cache_mode == "all"
                 and not model_config.supports_mamba_prefix_caching
@@ -354,10 +370,29 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                 assert vllm_config.scheduler_config.enable_chunked_prefill, (
                     "Chunked prefill is required for mamba cache mode 'align'."
                 )
-                assert not vllm_config.speculative_config, (
-                    "Mamba cache mode 'align' is currently not compatible "
-                    "with speculative decoding."
-                )
+                # [FA2/SM70] ЗАПРЕТ align+СПЕКУЛЯЦИЯ: ПРОВЕРЕН ОПЫТОМ И ОСТАВЛЕН.
+                # Причина запрета у авторов: спекуляция уводит состояние mamba на k+1 токенов
+                # вперёд, и отклонённые токены оставляют в кэш-блоке испорченное состояние.
+                # 19.08 гипотеза «блок mamba 1568 токенов не пересекается спекуляцией на 4»
+                # ПРОВЕРЕНА ГЕЙТОМ ТОЖДЕСТВЕННОСТИ (один вход дважды, temperature=0) и
+                # ОПРОВЕРГНУТА: на 15K префиксе, где кэш реально сработал (x2.56), повторный
+                # ответ РАЗОШЁЛСЯ с первым. Порча ТИХАЯ -- начало текста совпадает. Короткие
+                # случаи и ветвление прошли, потому там кэш почти не работает.
+                # Рычаг FA2SM70_ALIGN_SPEC=1 оставлен ТОЛЬКО для повторного исследования.
+                # Настоящая починка = реализовать mamba_cache_mode='all' для Qwen3.5
+                # (сохранение/восстановление GDN-состояния по блокам) -- у авторов не сделано
+                # (NotImplementedError в qwen3_5.py).
+                import os as _os
+                if _os.environ.get("FA2SM70_ALIGN_SPEC", "0") != "1":
+                    assert not vllm_config.speculative_config, (
+                        "Mamba cache mode 'align' is currently not compatible "
+                        "with speculative decoding."
+                    )
+                elif vllm_config.speculative_config:
+                    logger.warning(
+                        "[fa2_sm70] align+спекуляция РАЗРЕШЕНЫ рычагом FA2SM70_ALIGN_SPEC=1 "
+                        "-- обязателен гейт тождественности повторного ответа"
+                    )
             logger.info(
                 "Warning: Prefix caching in Mamba cache '%s' "
                 "mode is currently enabled. "
@@ -480,11 +515,38 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
             # easily by changing the way we layout chunks in the
             # mamba2 kernels.
 
+            # [FA2/SM70, задача 194] ГРАНУЛЯРНОСТЬ СОСТОЯНИЯ -- ОТДЕЛЬНАЯ ВЕЛИЧИНА.
+            # Страница mamba НЕ зависит от размера блока (это размер состояния), а память
+            # при 'all' равна cdiv(длина, блок) * страница. Значит, храня состояние РЕЖЕ,
+            # мы линейно уменьшаем число блоков, нужных рекуррентным слоям, -- и ёмкость
+            # растёт, хотя сжатия не было. Цена -- грубее гранулярность попадания в кэш
+            # (префикс должен совпасть до границы блока состояния).
+            # Множитель FA2SM70_MAMBA_BLK_MULT: 1 = как у авторов.
+            import os as _os
+            _blk_mult = max(1, int(_os.environ.get("FA2SM70_MAMBA_BLK_MULT", "1")))
             base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
-            cache_config.mamba_block_size = attn_block_size
+            cache_config.mamba_block_size = attn_block_size * _blk_mult
+            # [FA2/SM70 26.08] В РАЗДЕЛЬНОМ РЕЖИМЕ БЛОК ВНИМАНИЯ РАВЕН БЛОКУ СОСТОЯНИЯ.
+            # ОТКАЗ, КОТОРЫЙ ЭТО ЛЕЧИТ: в раздельном режиме число блоков ОБЩЕЕ для всех групп
+            # (kv_cache_utils, задача 194), а блок состояния при множителе K покрывает в K раз
+            # больше токенов, чем блок внимания. Значит на каждый блок внимания выделяется
+            # ЦЕЛЫЙ блок состояния, и (K-1)/K его объёма простаивает. Замер при K=2, пул 8 ГиБ:
+            # сумма страниц 80.8 МиБ на строку -> 101 блок -> ёмкость 206 848 токенов, тогда как
+            # по цене токена (30.7 КиБ) должно выходить ~273 000. Запрос на 240K при этом НЕ
+            # отклоняется, а ВСТАЁТ ЖДАТЬ блоков, которых не будет -- сервер выглядит зависшим.
+            # Сравняв блоки, простой убираем: строка покрывает K*2048 токенов у обеих групп.
+            # Цена -- гранулярность попадания префикс-кэша, но она и так равна НОК блоков,
+            # то есть блоку состояния; хуже не становится.
+            if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1" and _blk_mult > 1:
+                attn_block_size = cache_config.mamba_block_size
+                logger.info(
+                    "[fa2_sm70] РАЗДЕЛЬНЫЕ СТРАНИЦЫ: блок внимания поднят до блока состояния "
+                    "(%d токенов) -- иначе (K-1)/K каждого блока состояния простаивает",
+                    attn_block_size,
+                )
         else:
             # Without prefix caching, select minimum valid attention block size
             # to minimize mamba state padding
@@ -521,6 +583,22 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 
         if attn_page_size == mamba_page_size:
             # don't need to pad mamba page size
+            return
+
+        # [FA2/SM70, задача 194] В РАЗДЕЛЬНОМ РЕЖИМЕ ПАДДИНГ НЕ НУЖЕН И ВРЕДЕН.
+        # Он существует только чтобы страницы всех слоёв совпали в общем буфере. При
+        # FA2SM70_SPLIT_POOLS=1 буфер у каждого слоя свой, и добивать страницу состояния до
+        # страницы внимания -- значит выбросить ровно ту память, ради которой всё делается
+        # (замерено: паддинг 147%, то есть 3/5 страницы состояния -- пустота).
+        # ВНИМАНИЕ: импорт здесь СВОЙ. Прежде `_os` брался из ветки префикс-кэша выше, и при
+        # FA2SM70_MAMBA_ALL=0 подъём падал с UnboundLocalError -- ветка та, а импорт другой.
+        import os as _os  # noqa: PLC0415
+        if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1":
+            logger.info(
+                "[fa2_sm70] раздельные страницы: паддинг состояния до страницы внимания "
+                "СНЯТ (страница состояния %.2f МиБ против страницы внимания %.2f МиБ)",
+                mamba_page_size / 2**20, attn_page_size / 2**20,
+            )
             return
 
         # pad mamba page size to exactly match attention

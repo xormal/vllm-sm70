@@ -1030,9 +1030,31 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+    # [FA2/SM70 26.08] МЕЛКИЙ ТИП НЕ ДОЛЖЕН ЗАДАВАТЬ РАЗМЕР ГРУППЫ ВСЕМ ОСТАЛЬНЫМ.
+    # У нас три типа: внимание цели 16 слоёв, GDN 48 и внимание ЧЕРНОВИКА 5. Минимум даёт
+    # черновик -> group_size=5 -> GDN разбивается на cdiv(48,5)=10 групп, внимание цели на 4,
+    # итого ПЯТНАДЦАТЬ групп. Замер: метаданные внимания 3.2 мс на шаг, и отчёт о ёмкости
+    # делится на число групп (занижает втрое). Без спекуляции минимум был бы 16 и групп вышло
+    # бы ЧЕТЫРЕ. То есть дробление -- следствие пятислойного черновика, а не свойство модели.
+    # Рядом в этом же файле стоит FIXME автора: «для сложных образцов нужна стратегия получше».
+    # Здесь: типы, чья доля меньше `FA2SM70_KV_GROUP_MINFRAC` от самого крупного, из выбора
+    # минимума ИСКЛЮЧАЮТСЯ (их собственные группы при этом строятся как прежде -- просто их
+    # будет одна). Умолчание 0 -- поведение НЕ меняется ни на бит, файл общий с боевым.
+    _счёт = [len(layers) for layers in same_type_layers.values()]
+    _дол = float(os.environ.get("FA2SM70_KV_GROUP_MINFRAC", "0"))
+    if _дол > 0 and len(_счёт) > 1:
+        _порог = max(_счёт) * _дол
+        _крупные = [c for c in _счёт if c >= _порог]
+        min_num_layers = min(_крупные) if _крупные else min(_счёт)
+        if min_num_layers != min(_счёт):
+            logger.info(
+                "[fa2_sm70] размер KV-группы %d вместо %d: мелкие типы %s исключены "
+                "(порог %.0f%% от %d)", min_num_layers, min(_счёт),
+                [c for c in _счёт if c < _порог], _дол * 100, max(_счёт))
+    else:
+        min_num_layers = min(_счёт)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
+    max_num_layers = max(_счёт)
     if max_num_layers < min_num_layers * 1.25:
         # If the number of layers is not much larger than the minimum number of layers,
         # use the maximum number of layers as the group size to avoid too many padding
@@ -1121,6 +1143,44 @@ def get_kv_cache_config_from_groups(
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
+        # [FA2/SM70, задача 194] РАЗДЕЛЬНЫЕ СТРАНИЦЫ (FA2SM70_SPLIT_POOLS=1).
+        # У авторов все группы обязаны иметь ОДНУ страницу (в их же комментарии выше:
+        # "non-trivial due to memory fragmentation"), и страница рекуррентных слоёв
+        # добивается до страницы внимания. Из-за этого расход равен
+        #     число_слоёв * байты_на_токен_внимания
+        # и не зависит НИ от размера состояния, НИ от размера блока -- замерено: сжатие
+        # состояния до fp16 не дало ни одного токена, всё ушло в паддинг 147%.
+        # Здесь каждый слой получает СВОЙ буфер по СВОЕЙ странице, а число блоков одинаково
+        # для всех групп (тогда номера блоков у каждой группы свои, и делить их не нужно).
+        # Фрагментации нет по построению: внутри буфера блоки одного размера.
+        import os as _os
+        if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1":
+            _per_layer = [
+                (name, group.kv_cache_spec.page_size_bytes)
+                for group in kv_cache_groups
+                for name in group.layer_names
+            ]
+            _sum_page = sum(sz for _, sz in _per_layer)
+            num_blocks = may_override_num_blocks(
+                vllm_config, int(available_memory // _sum_page)
+            )
+            logger.info(
+                "[fa2_sm70] РАЗДЕЛЬНЫЕ СТРАНИЦЫ: %d слоёв, сумма страниц %.2f МиБ, "
+                "блоков на группу %d (у авторов было бы %d при единой странице %.2f МиБ)",
+                len(_per_layer), _sum_page / 2**20, num_blocks,
+                int(available_memory // max(sz for _, sz in _per_layer) // group_size),
+                max(sz for _, sz in _per_layer) / 2**20,
+            )
+            kv_cache_tensors = [
+                KVCacheTensor(size=sz * num_blocks, shared_by=[name])
+                for name, sz in _per_layer
+            ]
+            return KVCacheConfig(
+                num_blocks=num_blocks,
+                kv_cache_tensors=kv_cache_tensors,
+                kv_cache_groups=kv_cache_groups,
+            )
+
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
@@ -1186,6 +1246,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     dtype=spec.dtype,
                     sliding_window=spec.sliding_window,
                     page_size_padded=spec.page_size_padded,
+                    cache_dtype_str=spec.cache_dtype_str,
                 )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -1195,6 +1256,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     dtype=spec.dtype,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=spec.page_size_padded,
+                    cache_dtype_str=spec.cache_dtype_str,
                 )
 
     if not (
@@ -1242,6 +1304,29 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
+    # [FA2/SM70] В раздельном режиме уравнивать страницы НЕ НАДО и НЕЛЬЗЯ: эта функция либо
+    # растягивает блок слоя в целое число раз (тогда состояние хранится реже -- и префикс-кэш
+    # грубеет, замерено: при блоке состояния 16K кэш вырождается в ноль), либо отказывает
+    # вовсе, если страницы некратны (наш случай: 0.81 МиБ против 2 МиБ).
+    import os as _os_u
+    if _os_u.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1":
+        # ГРУППИРОВКА ПО ТИПУ, А НЕ ПО СЛОЮ (правка 20.08). Функция ниже делит слои так,
+        # чтобы у групп совпала СУММАРНАЯ страница; при разных страницах это вырождается в
+        # группу-на-слой -- 64 группы вместо двух. Цена вырождения замерена: поиск префикса
+        # идёт ПО КАЖДОЙ группе отдельно (kv_cache_coordinator), и на двух запросах по 200K
+        # счётчик движка показал 596 266 обращений к кэшу при НУЛЕ попаданий.
+        # Раздельные буферы от этого не страдают: тензор всё равно создаётся НА СЛОЙ
+        # (shared_by=[name] выше), а группа задаёт лишь общий номер блока -- ровно как у
+        # авторов для однотипных слоёв.
+        _классы: dict[str, list[str]] = {}
+        for _имя, _спек in kv_cache_spec.items():
+            _классы.setdefault(repr(_спек), []).append(_имя)
+        logger.info(
+            "[fa2_sm70] РАЗДЕЛЬНЫЕ СТРАНИЦЫ: групп по ТИПУ %d (слоёв %d) -- "
+            "поиск префикса идёт по типу, а не по каждому слою",
+            len(_классы), len(kv_cache_spec),
+        )
+        return create_kv_cache_group_specs(kv_cache_spec, list(_классы.values()))
     kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
     # Model contains multiple attention types, but KV cache of all layers
     # have the same physical memory per block per layer. Split the layers
@@ -1303,6 +1388,39 @@ def _report_kv_cache_config(
             pcp_size,
             dcp_size,
         )
+    # [FA2/SM70] ОПИСЬ ЦЕНЫ ТОКЕНА ПО ГРУППАМ. Только лог, за переменной FA2SM70_KV_OPIS=1.
+    # Цена токена = (число групп x ПОДБИТАЯ страница) / минимальный блок: подбивка одинакова
+    # у всех групп, поэтому маленькая настоящая страница платит за большую чужую.
+    import os as _os_opis
+
+    if _os_opis.environ.get("FA2SM70_KV_OPIS") == "1":
+        _всего = 0
+        for _i, _g in enumerate(kv_cache_config.kv_cache_groups):
+            _s = _g.kv_cache_spec
+            if hasattr(_s, "shapes") and hasattr(_s, "dtypes"):
+                from math import prod as _prod
+
+                from vllm.utils.torch_utils import get_dtype_size as _dsz
+
+                _real = sum(
+                    _prod(_sh) * _dsz(_dt) for _sh, _dt in zip(_s.shapes, _s.dtypes)
+                )
+            else:
+                _real = getattr(_s, "real_page_size_bytes", _s.page_size_bytes)
+            _цена = _s.page_size_bytes / _s.block_size
+            _всего += _цена
+            logger.info(
+                "[FA2/SM70 ОПИСЬ] группа %d: %s слоёв=%d блок=%d страница=%.1f КиБ "
+                "(настоящая %.1f КиБ, подбивка x%.2f) -> %.2f КиБ/токен",
+                _i, type(_s).__name__, len(_g.layer_names), _s.block_size,
+                _s.page_size_bytes / 1024, _real / 1024,
+                _s.page_size_bytes / max(_real, 1), _цена / 1024,
+            )
+        logger.info(
+            "[FA2/SM70 ОПИСЬ] ИТОГО %d групп, %.2f КиБ/токен, блоков %d",
+            len(kv_cache_config.kv_cache_groups), _всего / 1024, kv_cache_config.num_blocks,
+        )
+
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
@@ -1340,6 +1458,19 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+
+    # [FA2/SM70] В раздельном режиме страницы РАЗНЫЕ, и get_uniform_page_size здесь упал бы.
+    # Считаем честно: сумма по слоям (страница слоя * блоков под максимальную длину).
+    import os as _os
+    if _os.environ.get("FA2SM70_SPLIT_POOLS", "0") == "1":
+        итог = 0
+        for _g in kv_cache_groups:
+            _spec = _g.kv_cache_spec
+            _blocks = cdiv(
+                _spec.max_memory_usage_bytes(vllm_config), _spec.page_size_bytes
+            )
+            итог += len(_g.layer_names) * _spec.page_size_bytes * _blocks
+        return итог
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

@@ -46,6 +46,11 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )
     FLASH_ATTN_V100 = "vllm.v1.attention.backends.flash_attn_v100.FlashAttnV100Backend"
+    # Nash vtoroy sposob vstraivaniya (perenesyon iz 1Cat-vLLM-fa2-work 04.08.2026).
+    # VNE spiska prioriteta sm_70 v platforms/cuda.py NAMERENNO: umolchanie obyazano ostatsya
+    # prezhnim (FLASH_ATTN_V100), inache A/B mezhdu dvumya nashimi bekendami teryaet smysl.
+    # Vybiraetsya tolko yavno: VLLM_ATTENTION_BACKEND=FA2_SM70 ili --attention-backend FA2_SM70.
+    FA2_SM70 = "vllm.v1.attention.backends.fa2_sm70.FA2SM70Backend"
     TRITON_ATTN = "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
     ROCM_ATTN = "vllm.v1.attention.backends.rocm_attn.RocmAttentionBackend"
     ROCM_AITER_MLA = "vllm.v1.attention.backends.mla.rocm_aiter_mla.AiterMLABackend"

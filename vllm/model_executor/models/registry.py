@@ -485,6 +485,13 @@ _SPECULATIVE_DECODING_MODELS = {
     "MiMoMTPModel": ("mimo_mtp", "MiMoMTP"),
     "EagleLlamaForCausalLM": ("llama_eagle", "EagleLlamaForCausalLM"),
     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+    # [FA2/SM70 24.08] Блочно-диффузионный черновик DFlash: k токенов за ОДИН проход,
+    # скользящее окно 2048 -- время черновика НЕ зависит от длины контекста.
+    "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    # [FA2/SM70 25.08] ОТМЕНЕНО СВЕДЕНИЕ К V1: V2-раннер НАПИСАН НАМИ (v1/spec_decode/dflash2.py),
+    # вместе с моделью (qwen3_dflash2.py). Сведение к первой версии теряло СЕЛЕКТОР КАНДИДАТОВ --
+    # то есть связывание позиций блока между собой, а это прямой вклад в приёмку.
+    "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
     "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "LlamaForCausalLMEagle3": ("llama_eagle3", "Eagle3LlamaForCausalLM"),

@@ -193,6 +193,54 @@ def chunk_gated_delta_rule(
         "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
     )
 
+    # [FA2/SM70 -- НАТИВНАЯ ВЕТКА СКАНА, БЕЗ ПИТОН-ПРОКЛАДОК ПОВЕРХ ИМПОРТОВ]
+    # Прежде наш скан вставал шимом (sitecustomize + подмена имени поверх импортов) -- это
+    # прокладка, и курс проекта её запрещает. Ветка живёт ЗДЕСЬ, в самом определении: путь
+    # один, искать нечего. Голова цепочки (l2norm + внутричанковый кумсум) остаётся
+    # трионовской (0.8% скана, ни одного матричного умножения); дальше -- наши HMMA-ядра
+    # (kkt -> solve_tril -> сшитое h+o+wu, fa2_sm70/gdn_scan.cu). Включение: FA2SM70_GDN=1.
+    # Откат ТОЛЬКО по форме; нехватка памяти отдаётся движку (запасной Triton-путь ТЯЖЕЛЕЕ
+    # основного и включается ровно когда памяти нет -- урок 11.08).
+    import os as _os
+    if _os.environ.get("FA2SM70_GDN", "0") == "1" and not head_first:
+        try:
+            from fa2_sm70 import gdn as _fa2_gdn
+            if not _fa2_gdn.supported(q, k, v, g, beta, initial_state, cu_seqlens):
+                raise NotImplementedError("форма вне инстанцированных")
+            _scale = k.shape[-1] ** -0.5 if scale is None else scale
+            _qn, _kn = (l2norm_fwd(q), l2norm_fwd(k)) if use_qk_l2norm_in_kernel else (q, k)
+            _gg = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+            _o, _ht = _fa2_gdn.chunk_gated_delta_rule_volta(
+                _qn.to(torch.float16).contiguous(), _kn.to(torch.float16).contiguous(),
+                v, _gg, beta, float(_scale), initial_state, bool(output_final_state),
+                cu_seqlens, v.dtype)
+            global _FA2SM70_SCAN_OURS
+            try:
+                _FA2SM70_SCAN_OURS += 1
+            except NameError:
+                _FA2SM70_SCAN_OURS = 1
+            if _FA2SM70_SCAN_OURS & (_FA2SM70_SCAN_OURS - 1) == 0:
+                import sys as _sys
+                print(f"[fa2_sm70 gdn] НАТИВНЫЙ СКАН отработал: {_FA2SM70_SCAN_OURS}",
+                      file=_sys.stderr, flush=True)
+            return _o, _ht
+        except torch.OutOfMemoryError:
+            raise
+        except Exception as _e:  # noqa: BLE001
+            if _os.environ.get("FA2SM70_GDN_STRICT", "0") == "1":
+                raise RuntimeError(
+                    f"[fa2_sm70] СТРОГИЙ РЕЖИМ: скан GDN не пошёл нашим ядром: "
+                    f"{type(_e).__name__}: {_e}") from _e
+            global _FA2SM70_SCAN_FB
+            try:
+                _FA2SM70_SCAN_FB += 1
+            except NameError:
+                _FA2SM70_SCAN_FB = 1
+            if _FA2SM70_SCAN_FB == 1:
+                import sys as _sys
+                print(f"[fa2_sm70 gdn] нативный скан: откат на Triton: "
+                      f"{type(_e).__name__}: {_e}", file=_sys.stderr, flush=True)
+
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "

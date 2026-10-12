@@ -28,6 +28,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    # [fa2_sm70] int8 + масштаб fp32 на (позицию, kv-голову) — формат бэкенда FA2_SM70
+    "int8_per_token_head",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]

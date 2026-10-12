@@ -29,9 +29,14 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+
+_FA2SM70_PROBE_MS = float(os.getenv("FA2SM70_PHASE_PROBE_MS", "0"))
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
+import os as _os_kva35
+_KVA_DIR_Q35 = _os_kva35.environ.get("FA2SM70_KVA_DUMP", "")   # прибор KVA (записка 26 §6)
+_KVA_SPLIT_Q35 = int(_os_kva35.environ.get("FA2SM70_KVA_SPLIT", "32"))
 from vllm.config import (
     VllmConfig,
 )
@@ -162,6 +167,9 @@ def _mark_default_sm70_dense_modules(model: nn.Module, tp_size: int) -> None:
             continue
         if prefix.rsplit(".", 1)[-1] in suffixes:
             setattr(module, "_sm70_f16_force_enable", True)
+
+
+_FA2SM70_MAMBA_ALL = os.environ.get("FA2SM70_MAMBA_ALL", "0") == "1"
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -417,6 +425,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+_FA2SM70_MEGA = os.environ.get("FA2SM70_MEGA") == "1"   # решается ОДИН раз, при импорте
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -427,6 +438,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "inputs_embeds": 0,
     }
 )
+
+
 class Qwen3_5Model(Qwen3NextModel):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
@@ -466,6 +479,15 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
+        # [fa2_sm70] ВЛАДЕЛЕЦ СЕБЯ ОБЪЯВЛЯЕТ. Шесть попыток опознать держатель слоёв снаружи (класс,
+        # структура, поле, сборщик мусора, обёртка forward) дали ноль: тело внимания его не видит, а
+        # forward закрыт torch.compile. Регистрация в точке СОЗДАНИЯ -- единственный ключ по владению.
+        try:
+            import fa2_sm70.megastep as _fa2ms
+            _fa2ms.register_model(self)
+        except Exception:
+            pass
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         from vllm.model_executor.model_loader.weight_utils import (
@@ -538,6 +560,16 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                # [fa2_sm70 patch] A quantised checkpoint brings parameters that have NO output
+                # dim -- GPTQ's `g_idx` is one value per INPUT row and is therefore shared by every
+                # output shard of a merged column-parallel layer, so it must be loaded whole rather
+                # than split. Without this the tuple-shard branch below dies on `param.output_dim`,
+                # and it dies inside a logger.debug() argument, so it fails even with debug logging
+                # off: "AttributeError: 'RowvLLMParameter' object has no attribute 'output_dim'".
+                # Splitting is only meaningful for parameters that HAVE an output dim.
+                if isinstance(shard_id, tuple) and getattr(param, "output_dim", None) is None:
+                    weight_loader(param, loaded_weight)
+                    break
                 if isinstance(shard_id, tuple):
                     # Split by the target module's output shard metadata
                     # instead of hardcoding tensor shapes.
@@ -671,7 +703,33 @@ class Qwen3_5Model(Qwen3NextModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # [FA2/SM70 24.08] СБОР ПРОМЕЖУТОЧНЫХ СОСТОЯНИЙ -- ДОСЛОВНО КАК У РОДИТЕЛЯ (qwen3_vl.py).
+        # Механизм в семействе УЖЕ ЕСТЬ: `set_aux_hidden_state_layers` унаследован и заполняет
+        # `aux_hidden_state_layers`, а сбор идёт в forward Qwen3VLModel. Но ЭТОТ forward
+        # переопределён и поле игнорировал -- поэтому блочный черновик (DFlash), которому нужны
+        # признаки пяти слоёв целевой модели, не получал ничего. Своего механизма не изобретаем:
+        # повторяем родительский один в один, чтобы поведение совпадало.
+        # Когда сбор выключен, кортеж слоёв ПУСТ: ни одной лишней операции на 64 слоях.
+        # Поле заводится в другой ветке семейства (qwen3_moe), у нашего класса его может не быть:
+        # берём безопасно, умолчание -- пустой кортеж, то есть сбор выключен.
+        if not hasattr(self, "aux_hidden_state_layers"):
+            self.aux_hidden_state_layers: tuple[int, ...] = ()
+        aux_hidden_states = []
+        for layer_idx, layer in islice(
+            enumerate(self.layers), self.start_layer, self.end_layer
+        ):
+            if layer_idx in self.aux_hidden_state_layers:
+                # [FA2/SM70 27.08] ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ ПРИБОРА ФАЗ. Вставка ЗАВЕДОМОЙ задержки
+                # (FA2SM70_PHASE_PROBE_MS=N). Прибор обязан показать РОВНО её прибавку.
+                if _FA2SM70_PROBE_MS and layer_idx == self.start_layer:
+                    torch.cuda._sleep(int(_FA2SM70_PROBE_MS * 1.4e6))
+                aux_hidden_states.append(hidden_states + residual)
+            # [FA2/SM70 13.09, ПРИБОР KVA] Этот forward ПЕРЕОПРЕДЕЛЁН -- крюк в Qwen3NextModel.forward сюда не доходит
+            # (потеряно 3 прогона сбора). Дамп потока на входе слоя FA2SM70_KVA_SPLIT через custom op из qwen3_next
+            # (непрозрачен для Dynamo, проверка флага ON -- во время работы; выход op подставляется в поток, чтобы
+            # компилятор не выбросил его как мёртвый код). Умолчание -- выключено (FA2SM70_KVA_DUMP пуст).
+            if _KVA_DIR_Q35 and layer_idx == _KVA_SPLIT_Q35 and residual is not None:
+                hidden_states = torch.ops.fa2sm70.kva_dump(hidden_states, residual, positions, _KVA_SPLIT_Q35)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -683,6 +741,9 @@ class Qwen3_5Model(Qwen3NextModel):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -712,10 +773,16 @@ class Qwen3_5ForCausalLMBase(
         cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
-        if cache_config.mamba_cache_mode == "all":
+        # [FA2/SM70, задача 194] РЕЖИМ 'all' РЕАЛИЗОВАН: состояние GDN сохраняется на каждой
+        # границе блока (gdn_attn.py -- индексы блоков, qwen3_next.py -- резка префилла по
+        # границам и раздельные блоки чтения/записи в декоде). Запрет снят, но включение
+        # оставлено РЫЧАГОМ FA2SM70_MAMBA_ALL=1: 'all' держит страницы под ВСЕ 64 слоя, а не
+        # под 16 слоёв внимания, и при том же пуле ёмкость контекста падает ~392K -> ~98K.
+        # Это размен, а не улучшение, поэтому умолчанием он не становится.
+        if cache_config.mamba_cache_mode == "all" and not _FA2SM70_MAMBA_ALL:
             raise NotImplementedError(
-                "Qwen3.5 currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
+                "Режим 'all' собран, но выключен: включается FA2SM70_MAMBA_ALL=1 "
+                "(цена -- ёмкость контекста, см. research/23)"
             )
         self.quant_config = vllm_config.quant_config
 
@@ -818,6 +885,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
+    # ВОЗМОЖНОСТЬ, а не желание: режим 'all' для GDN реализован (задача 194). Объявлять его
+    # УСЛОВНО нельзя -- реестр кэширует сведения о классе по хэшу МОДУЛЯ и переменных
+    # окружения не видит, поэтому условный атрибут один раз попал в кэш как «нет поддержки»
+    # и залип. Выбор режима -- рычагом FA2SM70_MAMBA_ALL в config.py, где он и уместен.
+    supports_mamba_prefix_caching = True
+
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],

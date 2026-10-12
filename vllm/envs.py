@@ -458,6 +458,16 @@ def get_env_or_set_default(
 logger = logging.getLogger(__name__)
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # [fa2_sm70] Вентиль нашего бэкенда внимания FA2_SM70 (platforms/cuda.py читает os.environ
+    # напрямую). ОБЪЯВЛЕНИЕ ЗДЕСЬ -- НЕ КОСМЕТИКА: compile_factors() берёт «все известные»
+    # переменные, и без этой записи хэш компил-кэша НЕ РАЗЛИЧАЛ бэкенды, а графы у них разные
+    # (forward_includes_kv_cache_update) -- кэш от одного бэкенда рушил подъём другого
+    # (IndexError в copy_misaligned_inputs на profile_run, 18.08.2026).
+    "VLLM_SM70_FA2": lambda: os.getenv("VLLM_SM70_FA2", "0"),
+    # [FA2/SM70, задача 180] Подмена рекуррентного шага GDN в декоде (fa2_gdn_shim). Вызов
+    # запекается torch.compile в скомпилированный код -- без этой строки компил-кэш не
+    # различает REC=0/1 и подмена молча не участвует (тот же класс мины, что и выше).
+    "FA2SM70_GDN_REC": lambda: os.getenv("FA2SM70_GDN_REC", "0"),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

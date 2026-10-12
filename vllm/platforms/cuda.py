@@ -75,6 +75,17 @@ def _get_backend_priorities(
             ]
         elif device_capability.major == 7:
             # SM70 (V100): Use Flash Attention V100 with Tensor Core acceleration
+            # FA2_SM70 -- nash vtoroy bekend (perenesyon 04.08.2026). Vstavlyaetsya v spisok
+            # TOLKO po yavnomu VLLM_SM70_FA2=1. Bez peremennoy spisok BIT V BIT prezhniy,
+            # poetomu perezapusk bez neyo vedyot sebya tak zhe, kak do perenosa.
+            # VNIMANIE: etot vybor keshiruetsya, poetomu peremennaya obyazana stoyat V OKRUZHENII
+            # do pervogo vyzova, a ne vystavlyatsya na khodu.
+            if os.environ.get("VLLM_SM70_FA2", "0") not in ("0", "", "false", "False"):
+                return [
+                    AttentionBackendEnum.FA2_SM70,
+                    AttentionBackendEnum.FLASH_ATTN_V100,
+                    AttentionBackendEnum.TRITON_ATTN,
+                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_V100,
                 AttentionBackendEnum.TRITON_ATTN,
@@ -446,6 +457,19 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
+        # SM70 + bf16: ПРОПУСКАЕМ. Эта проверка смотрит ТОЛЬКО на номер архитектуры и падает до
+        # всякой работы. У Volta действительно нет нативной bf16-инструкции в тензорных ядрах, но
+        # это не значит "нельзя запустить": наши ядра внимания bf16 берут, и Gemma-4-12B в bf16 на
+        # V100 уже гонялась нашим ядром и валидировалась против FlashAttention-2 на A100
+        # (fa2_sm70_full_validation_20260721/RESULTS_gemma4_A100_vs_V100.md, тот же model.safetensors).
+        # Через vLLM эта дверь просто не была открыта. Причина, по которой это важно: Gemma-4 в fp16
+        # ВЫРОЖДАЕТСЯ (забор из "!") -- замерено и с нашим шимом, и БЕЗ него, то есть переливается
+        # сама модель. bf16 -- её родной формат, и другого пути к ней на этой машине нет.
+        # Выключатель: FA2SM70_ALLOW_BF16=0 вернёт штатный отказ.
+        import os as _os
+        if (dtype == torch.bfloat16 and _os.environ.get("FA2SM70_ALLOW_BF16", "1") != "0"
+                and cls.has_device_capability(70)):
+            return
         if dtype == torch.bfloat16:  # noqa: SIM102
             if not cls.has_device_capability(80):
                 capability = cls.get_device_capability()

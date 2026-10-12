@@ -45,6 +45,8 @@ MTPModelTypes = Literal[
 ]
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
+    "dflash",   # [FA2/SM70] блочно-диффузионный черновик, см. v1/spec_decode/dflash.py
+    "dflash2",  # [FA2/SM70 25.08] он же со СВЯЗЫВАНИЕМ блока: селектор кандидатов + точный путь
     "ngram",
     "medusa",
     "mlp_speculator",
@@ -435,6 +437,12 @@ class SpeculativeConfig:
                         )
                 elif self.method == "draft_model":
                     pass
+                elif self.method in ("dflash", "dflash2"):
+                    # [FA2/SM70 24.08] Блочно-диффузионный черновик: k токенов за ОДИН проход и
+                    # СКОЛЬЗЯЩЕЕ ОКНО 2048 -- его цена не растёт с длиной контекста. Именно это
+                    # снимает статью, которую наш замер назвал главной: 14.3 мс НА КАЖДЫЙ проход
+                    # авторегрессивного черновика.
+                    pass
                 else:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"
@@ -738,7 +746,12 @@ class SpeculativeConfig:
                 )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        # [FA2/SM70 24.08] "dflash" ВКЛЮЧЁН СЮДА СОЗНАТЕЛЬНО. Этот предикат управляет не выбором
+        # тела, а ВЕТКОЙ ПУТИ: вызов предлагателя, подготовка метаданных и передача признаков
+        # целевой модели. DFlash по устройству eagle-подобный (черновик работает на скрытых
+        # состояниях цели, его предлагатель наследует тот же SpecDecodeBaseProposer), поэтому
+        # ему нужна ровно эта ветка. Без него `draft_token_ids` просто не присваивался.
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dflash2")
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

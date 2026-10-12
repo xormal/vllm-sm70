@@ -157,7 +157,7 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format = cls.get_from_keys_or(
             config, ["checkpoint_format"], default=""
         )
-        return cls(
+        obj = cls(
             weight_bits,
             group_size,
             desc_act,
@@ -167,6 +167,15 @@ class GPTQConfig(QuantizationConfig):
             modules_in_block_to_quantize,
             checkpoint_format,
         )
+        # [fa2_sm70 patch] Carry `modules_to_not_convert` through, as the AWQ config already does.
+        # It is not used for the quantise/skip decision here (that is `dynamic`), but MODELS read it:
+        # qwen3_5.py's _uses_split_gdn_input_projections() asks whether in_proj_a/b were left in
+        # fp16, and builds SPLIT `in_proj_qkvz` + `in_proj_ba` modules if so, or one fused BF16-style
+        # `in_proj_qkvz` if not. Without this attribute GPTQ always looked unsplit, so the model
+        # expected a single fused `in_proj_qkvz.weight` that a split quantised checkpoint does not
+        # have -- it loaded with only a warning and then emitted pure garbage.
+        obj.modules_to_not_convert = config.get("modules_to_not_convert") or []
+        return obj
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

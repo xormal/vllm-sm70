@@ -36,6 +36,7 @@ from multiprocessing import shared_memory
 from typing import Any
 from unittest.mock import patch
 
+import os
 import torch
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
@@ -113,7 +114,14 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+# ФАЛЬСИФИКАТОР СНЯТИЕМ ФАЗЫ (fa2_sm70). Ответ становится ЗАВЕДОМО НЕВЕРНЫМ -- читается только
+# время. Разность даёт ДОЛЮ фазы обмена в периоде, а не догадку о ней. Умолчание ВЫКЛЮЧЕНО.
+_FA2SM70_NO_AR = os.environ.get("FA2SM70_FALSE_AR") == "1"
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    if _FA2SM70_NO_AR:
+        return tensor
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:

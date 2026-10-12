@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core import fa2sm70_tail
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -16,6 +17,9 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Счётчик промахов хвост-кэша: [по длине, по токенам]. Печать по степеням двойки.
+_fa2sm70_счёт = [0, 0]
 
 
 @dataclass
@@ -140,6 +144,16 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # НЕПРЕРЫВНЫЙ ХВОСТ. Размер блока берётся ТОТ ЖЕ, которым хэшируются блоки: координатор
+        # утверждает их совпадение (assert hash_block_size == self.block_size), поэтому смешение
+        # двух разных размеров здесь невозможно по построению.
+        self._fa2sm70_block_size = hash_block_size
+        # Запись, ИЗЪЯТАЯ из реестра под конкретный запрос. Реестр владел одной ссылкой на блоки;
+        # эта ссылка теперь наша, и её обязан отпустить ровно один путь -- либо после того как
+        # запрос сам взял блоки (allocate_slots), либо при освобождении запроса, если он так и не
+        # был запланирован. Иначе блок не вернётся в пул НИКОГДА.
+        self._fa2sm70_pending: dict[str, fa2sm70_tail.TailEntry] = {}
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -147,6 +161,9 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
+        pools = getattr(self.coordinator, "block_pools", None)
+        if pools and getattr(self.coordinator, "split_pools", False):
+            return max(p.get_usage() for p in pools)
         return self.block_pool.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
@@ -201,7 +218,146 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
+        if fa2sm70_tail.ENABLED:
+            computed_blocks, num_new_computed_tokens = self._fa2sm70_try_extend(
+                request, computed_blocks, num_new_computed_tokens
+            )
+
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    # ------------------------------------------------------------------ ХВОСТ
+
+    def _fa2sm70_try_extend(
+        self,
+        request: Request,
+        computed: tuple[list[KVCacheBlock], ...],
+        num_computed: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Продлить попадание неполным блоком, переданным предыдущим ходом диалога.
+
+        Обычный поиск заканчивается на границе ЦЕЛОГО блока (здесь 1568 токенов). Если предыдущий
+        запрос оставил хвост ровно с этой границы, и токены совпали -- забираем его и объявляем
+        посчитанным ТОЧНОЕ число токенов, а не кратное блоку.
+        """
+        if not self.enable_caching:
+            return computed, num_computed
+        bs = self._fa2sm70_block_size
+        nfull = num_computed // bs
+        if num_computed % bs != 0:
+            # Уже невыровнено -- значит хвост подцеплен кем-то ещё; второй раз не продлеваем.
+            return computed, num_computed
+        parent = request.block_hashes[nfull - 1] if nfull > 0 else None
+        pool = self.block_pool
+        # Тот же запас, что у них: последний токен обязан считаться заново ради логитов.
+        max_len = request.num_tokens - 1
+        for n in pool.fa2sm70_tails.tail_lengths(parent):
+            end = nfull * bs + n
+            if end > max_len or end <= num_computed:
+                # ПЕЧАТЬ ПО СТЕПЕНЯМ ДВОЙКИ, А НЕ НА КАЖДУЮ ИТЕРАЦИЮ. Это горячий цикл
+                # ПЛАНИРОВЩИКА: он крутится тысячи раз в секунду, и одна строка на итерацию
+                # забивает канал вывода. Замерено 20.08: 1 313 177 строк из 1 313 716 в логе
+                # за 40 минут, EngineCore 39 % CPU при ПУСТОЙ очереди, новые запросы до движка
+                # не доходили вовсе -- сервер выглядел живым (/health 200), а генерация висела.
+                _fa2sm70_счёт[0] += 1
+                _c = _fa2sm70_счёт[0]
+                if _c & (_c - 1) == 0:
+                    logger.info(
+                        "[fa2_sm70 хвост] мимо по ДЛИНЕ: end=%d, посчитано=%d, предел=%d "
+                        "(таких промахов всего %d)",
+                        end, num_computed, max_len, _c,
+                    )
+                continue
+            mine = request.all_token_ids[nfull * bs : end]
+            key = fa2sm70_tail.make_tail_key(parent, mine)
+            entry = pool.fa2sm70_take_tail(key)
+            if entry is None:
+                # НЕ «просто мимо»: печатаем ПОЗИЦИЮ первого расхождения токенов. Хэш говорит
+                # только «не то», а нам нужно знать, ЧТО именно разошлось -- шаблон диалога,
+                # длина или содержимое.
+                theirs = pool.fa2sm70_tails.tokens_of(parent, n)
+                _fa2sm70_счёт[1] += 1
+                _c2 = _fa2sm70_счёт[1]
+                if theirs is not None and _c2 & (_c2 - 1) == 0:
+                    lim = min(len(mine), len(theirs))
+                    d = next((i for i in range(lim) if mine[i] != theirs[i]), lim)
+                    logger.info(
+                        "[fa2_sm70 хвост] мимо по ТОКЕНАМ: совпало %d из %d/%d, "
+                        "первое расхождение на %d (мой %s, записан %s)",
+                        d, len(mine), len(theirs), nfull * bs + d,
+                        mine[d] if d < len(mine) else None,
+                        theirs[d] if d < len(theirs) else None,
+                    )
+                continue
+            if len(entry.blocks_by_group) != len(computed):
+                # Состав групп изменился -- запись не наша, вернуть ссылку и идти дальше.
+                pool._fa2sm70_release_tail(entry)
+                continue
+            extended = tuple(
+                list(computed[i]) + list(entry.blocks_by_group[i])
+                for i in range(len(computed))
+            )
+            if fa2sm70_tail.POISON:
+                # ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ. Объявляем посчитанным на четыре токена больше, чем есть.
+                # Эти четыре не будут вычислены ни разу: у внимания останутся чужие слоты, у GDN --
+                # дыра в цепи состояния. Вывод ОБЯЗАН испортиться. Если он не испортился, значит
+                # восстановленный хвост ни на что не влияет, и «совпало» в основном опыте не
+                # доказывало ничего.
+                end += 4
+            self._fa2sm70_pending[request.request_id] = entry
+            # СЧЁТЧИК МАРШРУТА пишется ПО ФАКТУ работы. Без него «вывод совпал» доказывал бы лишь
+            # то, что мы сравнили прежний путь сам с собой.
+            logger.info(
+                "[fa2_sm70 хвост] ПОДХВАЧЕН: +%d ток (было %d, стало %d), реестр %s",
+                end - num_computed, num_computed, end, pool.fa2sm70_tails.stats,
+            )
+            return extended, end
+        return computed, num_computed
+
+    def _fa2sm70_settle(self, request_id: str) -> None:
+        """Отпустить ссылку реестра ПОСЛЕ того, как блоки взял сам запрос.
+
+        Порядок обязателен: сначала запрос делает touch (ref 1 -> 2), потом мы снимаем свою (2 -> 1).
+        Обратный порядок на миг обнулил бы счётчик, и блок ушёл бы в очередь свободных.
+        """
+        entry = self._fa2sm70_pending.pop(request_id, None)
+        if entry is not None:
+            self.block_pool._fa2sm70_release_tail(entry)
+
+    def _fa2sm70_register_tail(self, request: Request) -> None:
+        """Запомнить хвост завершившегося запроса: неполный блок KV + состояние GDN на его конце."""
+        if not self.enable_caching:
+            return
+        bs = self._fa2sm70_block_size
+        # ДЛИНА БЕРЁТСЯ ПО ФАКТИЧЕСКИ ПОСЧИТАННОМУ, а не по числу токенов заявки. У завершившегося
+        # запроса последний токен уже выбран, но его KV и состояние GDN в кэш НЕ записаны; у
+        # вытесненного посчитано и того меньше. Хвост, объявленный длиннее посчитанного, вернул бы
+        # блок, не соответствующий токенам, -- и это была бы ТИХАЯ неверность, а не падение.
+        total = request.num_computed_tokens
+        nfull = total // bs
+        tail_len = total - nfull * bs
+        if tail_len <= 0 or nfull > len(request.block_hashes):
+            # Ровно на границе (запоминать нечего) либо хэшей меньше, чем целых блоков.
+            return
+        parent = request.block_hashes[nfull - 1] if nfull > 0 else None
+        tail_ids = request.all_token_ids[nfull * bs : total]
+        key = fa2sm70_tail.make_tail_key(parent, tail_ids)
+        blocks_by_group: list[list[KVCacheBlock]] = []
+        for mgr in self.coordinator.single_type_managers:
+            req_blocks = mgr.req_to_blocks.get(request.request_id)
+            if req_blocks is None or len(req_blocks) <= nfull:
+                return
+            blk = req_blocks[nfull]
+            if blk is None or blk.is_null:
+                return
+            blocks_by_group.append([blk])
+        logger.info(
+            "[fa2_sm70 хвост] ЗАПОМНЕН: %d ток хвоста при %d посчитанных", tail_len, total
+        )
+        self.block_pool.fa2sm70_hold_tail(
+            fa2sm70_tail.TailEntry(
+                key, total, tuple(blocks_by_group), request.request_id, tail_ids
+            )
+        )
 
     def allocate_slots(
         self,
@@ -333,7 +489,9 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        # [FA2/SM70] В раздельном режиме сумма по разным пулам ничего не значит: место
+        # должно найтись В КАЖДОМ пуле отдельно (координатор помнит разрез по группам).
+        if not self.coordinator.has_free_blocks_for():
             # Cannot allocate new blocks
             return None
 
@@ -349,6 +507,16 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+
+        if fa2sm70_tail.ENABLED and request.request_id in self._fa2sm70_pending:
+            # Запрос уже сделал touch внутри allocate_new_computed_blocks -- снимаем ссылку реестра.
+            # И правим учёт: последний из взятых блоков НЕПОЛОН, значит он ещё НЕ захэширован, и
+            # считать его «уже закэшированным» нельзя -- иначе он не попадёт в кэш, когда дозаполнится.
+            for mgr in self.coordinator.single_type_managers:
+                n = mgr.num_cached_block.get(request.request_id)
+                if n:
+                    mgr.num_cached_block[request.request_id] = n - 1
+            self._fa2sm70_settle(request.request_id)
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -383,6 +551,10 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if fa2sm70_tail.ENABLED:
+            # Ссылка, взятая под этот запрос, но так и не отданная (запрос не был запланирован).
+            self._fa2sm70_settle(request.request_id)
+            self._fa2sm70_register_tail(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -415,6 +587,11 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        pools = getattr(self.coordinator, "block_pools", None)
+        if pools and getattr(self.coordinator, "split_pools", False):
+            if not all(p.reset_prefix_cache() for p in pools):
+                return False
+            return True
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -455,6 +632,10 @@ class KVCacheManager:
             group.
         """
         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
+
+    def new_step_starts(self) -> None:
+        """Начало шага планировщика."""
+        self.coordinator.new_step_starts()
 
     def take_events(self) -> list[KVCacheEvent]:
         """Take the KV cache events from the block pool.

@@ -67,10 +67,16 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     page_size_padded: int | None = None
+    # [fa2_sm70] Строка формата кэша: форматам *_per_token_head нужны масштабы fp32 на
+    # (позицию, kv-голову), и их память РЕЖЕТСЯ ИЗ ТОГО ЖЕ сырого буфера страницы (раскладку
+    # внутри страницы задаёт бэкенд через get_kv_cache_shape) — значит бюджетируется ЗДЕСЬ.
+    cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
         real_page_size = self.real_page_size_bytes
+        if self.cache_dtype_str in ("int8_per_token_head", "fp8_per_token_head"):
+            real_page_size += 2 * self.block_size * self.num_kv_heads * 4
         if self.page_size_padded is not None:
             assert self.page_size_padded >= real_page_size
             return self.page_size_padded
@@ -160,6 +166,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -353,6 +360,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )

@@ -835,12 +835,18 @@ class InputBatch:
             )
             allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
 
+        # [FA2/SM70 23.09] Наибольшее k -- с ХОЗЯЙСКОЙ копии: быстрый путь top-k/top-p
+        # (topk_topp_sampler, рычаг FA2SM70_TOPKP_FAST) обязан знать его без `int(k.max())`,
+        # то есть без синхронизации карты с хозяином. Атрибут живёт на самом срезе.
+        _fa2_top_k = None if self.no_top_k else self.top_k[:num_reqs]
+        if _fa2_top_k is not None and num_reqs > 0:
+            _fa2_top_k._fa2_kmax = int(self.top_k_cpu[:num_reqs].max())
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
-            top_k=None if self.no_top_k else self.top_k[:num_reqs],
+            top_k=_fa2_top_k,
             generators=self.generators,
             max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=prompt_token_ids,

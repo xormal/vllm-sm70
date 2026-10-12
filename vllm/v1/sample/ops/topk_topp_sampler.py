@@ -240,6 +240,123 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
+# [FA2/SM70 23.09] БЫСТРЫЙ ТОЧНЫЙ ПУТЬ top-k+top-p БЕЗ СОРТИРОВКИ ВСЕГО СЛОВАРЯ.
+# ЗАЧЕМ. generation_config модели навязывает top_k=20/top_p=0.95 ВСЕМ запросам без temperature=0,
+# и каждый сэмплирующий шаг спекуляции сортирует 248 320 логитов ДВАЖДЫ (бонусный токен + логиты
+# цели в отбраковщике). Замер (V100, 900 МГц): 3 строки 1.514 -> 0.646 мс, 4 -> 0.643, 8 -> 0.714.
+# ТОЧНОСТЬ -- ПОВТОРЕНИЕ СЕМАНТИКИ, А НЕ ПРИБЛИЖЕНИЕ, и в ней три тонкости, каждую поймал замер:
+#   * top-k здесь оставляет ВСЕ значения >= k-го (гасятся только строго меньшие). На логитах из fp16
+#     равенства на границе k -- 1-5 % строк; `topk(k)` ровно k давал расхождение в 0.1-0.3 % строк;
+#   * top-p считается по ВОЗРАСТАНИЮ, и порядок равных -- как у устойчивой сортировки (значение,
+#     затем индекс), иначе при границе top-p внутри группы равных выживает ДРУГОЙ из равных токенов;
+#   * k берётся с ХОЗЯЙСКОЙ копии параметров (атрибут `_fa2_kmax`, его ставит InputBatch), а не
+#     `int(k.max())`: это синхронизация карты с хозяином, а сэмплер стоит ДО черновика.
+# Итог сверки: 0 расхождений на 28 672 строках fp16-логитов со случайными k и p.
+# ОСТАТОЧНЫЙ СЛУЧАЙ: больше ЗАПАС токенов, строго равных k-му значению. Он учитывается НА КАРТЕ
+# (без синхронизации) и печатается раз в 4096 вызовов; в сверке не встретился ни разу.
+# На ОДНОЙ строке путь медленнее исходного (0.607 против 0.478 мс) -- там идёт исходный.
+import os as _fa2_os
+_FA2_TOPKP_FAST = _fa2_os.environ.get("FA2SM70_TOPKP_FAST", "0") == "1"
+_FA2_TOPKP_ZAPAS = int(_fa2_os.environ.get("FA2SM70_TOPKP_MARGIN", "32"))
+_FA2_TOPKP_KCAP = int(_fa2_os.environ.get("FA2SM70_TOPKP_KCAP", "1024"))
+_FA2_TOPKP_MINROWS = int(_fa2_os.environ.get("FA2SM70_TOPKP_MINROWS", "2"))
+_fa2_topkp_stat = {"быстрых": 0, "край": None}
+# ПРИБОРНЫЙ РЫЧАГ ДЛЯ ЧЕРЕДОВАНИЯ В ОДНОМ ЭКЗЕМПЛЯРЕ: если задан путь, быстрый путь включён, пока файл
+# существует. Разница 1-2 % тонет в разбросе между подъёмами (серия 80: ±5-10 % от чужой нагрузки
+# хозяина), а чередование по запросам в одном процессе делит дрейф поровну. Проверка файла -- не чаще
+# раза в 0.2 с, чтобы не добавлять хозяйской работы в каждый шаг.
+_FA2_TOPKP_FILE = _fa2_os.environ.get("FA2SM70_TOPKP_FAST_FILE", "")
+# ПРИБОРНЫЙ АУДИТ ТОЧНОСТИ В РАБОТЕ: на каждом быстром вызове считается и исходный путь, строки с
+# расхождением маски или значений копятся НА КАРТЕ (без синхронизации) и печатаются вместе с краем.
+# Сравнение ТЕКСТОВ при одном зерне этого не заменяет: оно смешивает точность пути с любым другим
+# недетерминизмом движка. Рычаг только для стенда: удваивает цену сэмплера.
+_FA2_TOPKP_AUDIT = _fa2_os.environ.get("FA2SM70_TOPKP_AUDIT", "0") == "1"
+_FA2_TOPKP_LOGN = max(1, int(_fa2_os.environ.get("FA2SM70_TOPKP_LOGN", "4096")))
+_fa2_topkp_файл = {"t": 0.0, "вкл": False}
+
+
+def _fa2_topkp_включён() -> bool:
+    if not _FA2_TOPKP_FILE:
+        return _FA2_TOPKP_FAST
+    import time as _t
+    теперь = _t.monotonic()
+    if теперь - _fa2_topkp_файл["t"] > 0.2:
+        _fa2_topkp_файл["t"] = теперь
+        _fa2_topkp_файл["вкл"] = _fa2_os.path.exists(_FA2_TOPKP_FILE)
+    return _fa2_topkp_файл["вкл"]
+
+
+def _apply_top_k_top_p_fast(logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor,
+                            kmax: int) -> torch.Tensor:
+    V = logits.shape[1]
+    global logits_audit_copy
+    logits_audit_copy = logits.clone() if _FA2_TOPKP_AUDIT else None
+    K2 = min(kmax + _FA2_TOPKP_ZAPAS, V)
+    зн, ид = logits.topk(K2, dim=-1)                                   # по убыванию
+    kth = зн.gather(1, (k.to(torch.long) - 1).clamp(min=0, max=K2 - 1).unsqueeze(1))
+    if K2 < V:
+        # равенства k-му, дошедшие до края запаса: считаем НА КАРТЕ, без чтения хозяином
+        край = (зн[:, -1:] >= kth).sum()
+        if _fa2_topkp_stat["край"] is None:
+            _fa2_topkp_stat["край"] = torch.zeros((), dtype=torch.long, device=logits.device)
+        _fa2_topkp_stat["край"].add_(край)
+    # порядок устойчивой сортировки по возрастанию: сперва по индексу, затем устойчиво по значению
+    пи = ид.argsort(dim=-1)
+    зн, ид = зн.gather(1, пи), ид.gather(1, пи)
+    пз = зн.argsort(dim=-1, stable=True)
+    зн, ид = зн.gather(1, пз), ид.gather(1, пз)
+    зн = зн.masked_fill(зн < kth, -float("inf"))
+    вер = зн.softmax(dim=-1)
+    нак = torch.cumsum(вер, dim=-1)
+    гасить = нак <= 1 - p.unsqueeze(dim=1)
+    гасить[:, -1] = False
+    зн = зн.masked_fill(гасить, -float("inf"))
+    out = torch.full_like(logits, -float("inf"))
+    out.scatter_(1, ид, зн)
+    _fa2_topkp_stat["быстрых"] += 1
+    if _FA2_TOPKP_AUDIT:
+        эт = _apply_top_k_top_p_orig(logits_audit_copy, k, p)
+        разн = ((torch.isinf(эт) != torch.isinf(out)) | ((эт != out) & ~torch.isinf(эт))).any(dim=-1).sum()
+        if _fa2_topkp_stat.get("аудит") is None:
+            _fa2_topkp_stat["аудит"] = torch.zeros((), dtype=torch.long, device=logits.device)
+            _fa2_topkp_stat["строк"] = 0
+        _fa2_topkp_stat["аудит"].add_(разн)
+        _fa2_topkp_stat["строк"] += int(logits.shape[0])
+    if (_fa2_topkp_stat["быстрых"] % _FA2_TOPKP_LOGN) == 1:
+        # раз в LOGN вызовов -- одна синхронизация ради сторожа края (и аудита), цена ничтожна
+        _к = int(_fa2_topkp_stat["край"].item()) if _fa2_topkp_stat["край"] is not None else 0
+        _а = (" | АУДИТ: строк %d, расхождений с исходным %d" % (
+            _fa2_topkp_stat["строк"], int(_fa2_topkp_stat["аудит"].item()))
+              if _FA2_TOPKP_AUDIT and _fa2_topkp_stat.get("аудит") is not None else "")
+        logger.info("[fa2_sm70 TOPKP] быстрый путь top-k/top-p: вызовов %d, строк с равенствами "
+                    "до края запаса (ЗАПАС=%d): %d%s", _fa2_topkp_stat["быстрых"], _FA2_TOPKP_ZAPAS, _к, _а)
+    return out
+
+
+def _apply_top_k_top_p_orig(logits, k, p):
+    """Исходный путь vLLM без быстрой ветки -- эталон приборного аудита."""
+    if p is None:
+        if k is None:
+            return logits
+        return apply_top_k_only(logits, k)
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    if k is not None:
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        top_k_mask = logits_sort < top_k_mask
+        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+    if p is not None:
+        probs_sort = logits_sort.softmax(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        top_p_mask[:, -1] = False
+        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+    return logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+
+
+logits_audit_copy = None
+
+
 def apply_top_k_top_p(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -252,6 +369,11 @@ def apply_top_k_top_p(
 
     The logits tensor may be updated in-place.
     """
+    if (_fa2_topkp_включён() and k is not None and p is not None
+            and logits.dim() == 2 and logits.shape[0] >= _FA2_TOPKP_MINROWS):
+        _kmax = getattr(k, "_fa2_kmax", None)
+        if _kmax is not None and 0 < int(_kmax) and int(_kmax) + _FA2_TOPKP_ZAPAS <= _FA2_TOPKP_KCAP:
+            return _apply_top_k_top_p_fast(logits, k, p, int(_kmax))
     if p is None:
         if k is None:
             return logits

@@ -7,6 +7,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -18,6 +20,8 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        # Режим 'all': читаем из одного блока, пишем в другой (задача 194).
+        "HAS_OUT_INDICES": lambda args: args["ssm_state_indices_out"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -36,6 +40,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     ht,
     cu_seqlens,
     ssm_state_indices,
+    ssm_state_indices_out,
     num_accepted_tokens,
     scale,
     N: tl.int64,
@@ -57,6 +62,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    HAS_OUT_INDICES: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -145,9 +151,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         if INPLACE_FINAL_STATE:
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
+            if HAS_OUT_INDICES:
+                final_state_idx = tl.load(ssm_state_indices_out + i_n).to(tl.int64)
+            else:
+                final_state_idx = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_t
+                ).to(tl.int64)
             if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -180,15 +189,124 @@ def fused_sigmoid_gating_delta_rule_update(
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    # Режим 'all': куда положить состояние, если это не тот блок, откуда оно прочитано.
+    ssm_state_indices_out: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    branch_at: int = 0,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
     """Fuse sigmoid gating with recurrent delta-rule update."""
+    # [FA2/SM70, задача 180 -- НАТИВНАЯ ВЕТКА, БЕЗ ПИТОН-ПРОКЛАДОК ПОВЕРХ ИМПОРТОВ]
+    # Слитый сигмоидный гейтинг + рекуррент нашим ядром volta_gdn_rec (fa2_sm70/gdn_scan.cu):
+    # состояние в регистрах, HBM дважды, гейтинг (softplus/sigmoid) внутри ядра. Сверено с этим
+    # же Triton-ядром на 12 случаях (o relL2 <= 5e-05, пул ~5e-08), в бою гейт '391' и декод
+    # без потерь. Включение: FA2SM70_GDN_REC=1 (объявлен в envs.py -- иначе компил-кэш не
+    # различает REC=0/1 и ветка МОЛЧА не участвует). Откат ТОЛЬКО по форме; нехватка памяти
+    # отдаётся движку (запасной Triton-путь тяжелее основного, урок 11.08).
+    if os.environ.get("FA2SM70_GDN_REC", "0") == "1":
+        try:
+            _hv = v.shape[2]
+            _a3 = a if a.dim() == 3 else a.view(1, -1, _hv)
+            _b3 = b if b.dim() == 3 else b.view(1, -1, _hv)
+            if (initial_state is None or not inplace_final_state or is_kda
+                    or float(beta) != 1.0 or float(threshold) != 20.0
+                    or q.shape[-1] != 128 or v.shape[-1] != 128
+                    or _hv % q.shape[2] != 0):
+                raise NotImplementedError("форма вне нашего рекуррента")
+            _scale = q.shape[-1] ** -0.5 if scale is None else scale
+            # ЕДИНЫЙ ЦЕЛОЧИСЛЕННЫЙ ТИП НА ВСЕЙ ТРОЙКЕ. Ядро инстанцируется по ОДНОМУ типу
+            # индекса, а приходить могут разные: таблица блоков int32, cu_seqlens int64,
+            # gather по .long() -- тоже int64. Прежде приводился только cu, и пара
+            # (индексы чтения, индексы записи) могла разъехаться -- ядро отказывало
+            # «expected Int but found Long», и декод молча уходил на Triton.
+            _cu = cu_seqlens
+            _idx_in = ssm_state_indices
+            _idx_out = ssm_state_indices_out
+            _тип = torch.int32
+            # Счётчик принятых токенов ядро читает как int32 (data_ptr<int>): приходит он
+            # 64-битным, и это давало тот же тихий уход на Triton, что и индексы.
+            _nacc = (num_accepted_tokens.to(_тип)
+                     if num_accepted_tokens is not None else None)
+            if _idx_in is not None:
+                _idx_in = _idx_in.to(_тип)
+            if _idx_out is not None:
+                _idx_out = _idx_out.to(_тип)
+            if _cu is not None:
+                _cu = _cu.to(_тип)
+            from fa2_sm70 import _ext as _fa2_ext
+            _o = _fa2_ext.gdn_ext().gdn_rec_gating(
+                A_log.float(), _a3.contiguous(), _b3.contiguous(), dt_bias.float(),
+                q.contiguous(), k.contiguous(), v.contiguous(), float(_scale),
+                initial_state, _idx_in, _nacc, _cu,
+                bool(use_qk_l2norm_in_kernel),
+                # Куда писать состояние, если это НЕ тот блок, откуда читали (режим 'all').
+                # None в остальных режимах -- ядро тогда пишет по прежнему индексу.
+                (_idx_out.contiguous() if _idx_out is not None else None),
+                # масштабы состояния: нужны только при int16-пуле (ход 20.08); при fp16/fp32
+                # передаём None и ядро их не читает
+                # ПРОБНИК «без масштабов» ОТВЕРГНУТ 06.09: при int16-пуле ядро без
+                # массива масштабов не запускается вовсе (движок не встаёт), поэтому
+                # локализовать падающее обращение так нельзя.
+                getattr(initial_state, "fa2sm70_scales", None),
+                # [ДЕРЕВО, 05.09] строка ветвления: b0 продолжает ЯКОРЬ, а не хвост ветви A
+                int(branch_at))
+            global _FA2SM70_REC_OURS
+            try:
+                _FA2SM70_REC_OURS += 1
+            except NameError:
+                _FA2SM70_REC_OURS = 1
+            if _FA2SM70_REC_OURS & (_FA2SM70_REC_OURS - 1) == 0:
+                import sys as _sys
+                print(f"[fa2_sm70 gdn] НАТИВНЫЙ РЕКУРРЕНТ декода отработал: {_FA2SM70_REC_OURS}",
+                      file=_sys.stderr, flush=True)
+            return _o, initial_state
+        except torch.OutOfMemoryError:
+            raise
+        except Exception as _e:  # noqa: BLE001 -- отказ формы: путь образца ниже
+            # ОТКАТ ЗАПРЕЩЁН ПРИ int16-ПУЛЕ. Triton-путь читает состояние как ЧИСЛА, а в
+            # int16-пуле лежат КОДЫ, масштаб к которым знает только наше ядро. Тихая порча
+            # тут страшнее падения: ответ останется правдоподобным (задача 195).
+            if (initial_state is not None
+                    and getattr(initial_state, "dtype", None) == torch.int16):
+                raise RuntimeError(
+                    "[fa2_sm70] состояние GDN в int16, а наш рекуррент не пошёл "
+                    f"({type(_e).__name__}: {_e}). Откат на Triton запрещён: он прочитает "
+                    "коды как числа. Выключите FA2SM70_GDN_I16 или почините форму.") from _e
+            if os.environ.get("FA2SM70_GDN_STRICT", "0") == "1":
+                raise RuntimeError(
+                    f"[fa2_sm70] СТРОГИЙ РЕЖИМ: рекуррент GDN не пошёл нашим ядром: "
+                    f"{type(_e).__name__}: {_e}") from _e
+            global _FA2SM70_REC_FB
+            try:
+                _FA2SM70_REC_FB += 1
+            except NameError:
+                _FA2SM70_REC_FB = 1
+            if _FA2SM70_REC_FB == 1:
+                import sys as _sys
+                print(f"[fa2_sm70 gdn] нативный рекуррент: откат на Triton: "
+                      f"{type(_e).__name__}: {_e}", file=_sys.stderr, flush=True)
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # ЗАПОЛНЕНИЕ МАШИНЫ: BV прибит константой, а правило выбора УЖЕ НАПИСАНО -- в соседней ветке.
+    #
+    # `min(next_power_of_2(V), 32)` -- это не выбор, а константа: при боевой геометрии (V=128, N=1,
+    # HV=24) она даёт NV=4 и грид (1, 4, 24) = 96 CTA на 80 SM, то есть 1.2 волны и 4.8 варпа на SM
+    # из 64 слотов. Рядом, в fused_recurrent.py:68, лежит `_select_sm70_bv` -- отлаженное правило,
+    # которое целится в 2 волны (160 CTA) и на той же геометрии выбрало бы BV=16 -> 192 CTA.
+    # Оно просто не вызывается ИЗ ЭТОЙ ветки, а боевой ходит именно сюда.
+    #
+    # ГЕЙТ С УМОЛЧАНИЕМ «КАК СЕЙЧАС». Этот файл лежит в дереве vLLM, а не в нашем, поэтому его НЕ
+    # закрывают две ветки дерева ядер (боевой слепок / рабочее): правка здесь достала бы боевой при
+    # ближайшем подъёме. Значит поведение по умолчанию НЕ меняется, пока ход не замерен;
+    # включается VLLM_SM70_FLA_GATING_BV=1.
+    BK = triton.next_power_of_2(K)
+    if os.environ.get("VLLM_SM70_FLA_GATING_BV") == "1":
+        from vllm.model_executor.layers.fla.ops.fused_recurrent import _select_sm70_bv
+        BV = _select_sm70_bv(V, N, HV, v.device)
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
@@ -238,6 +356,7 @@ def fused_sigmoid_gating_delta_rule_update(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
+        ssm_state_indices_out=ssm_state_indices_out,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
         N=N,

@@ -6,6 +6,7 @@
 
 
 import numpy as np
+import os
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -231,6 +232,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )[:, None]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
+            # ЗАЩИТА ЗАПИСИ: координата взята из КОЛОНКИ ЗАПИСИ таблицы и, в отличие от
+            # координаты чтения выше, НИЧЕМ не проверялась. При спекуляции колонка записи
+            # уходит вперёд колонки чтения и может попасть в паддинговый хвост; тогда
+            # координата = pad_slot_id (-1) и запись уходит ДО начала тензора состояний --
+            # тихая порча чужой памяти, всплывающая позже в произвольном ядре.
+            if USE_PAD_SLOT:  # noqa
+                mask = mask & (conv_states_output_coord != pad_slot_id)
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
             tl.store(conv_states_ptrs_target, loaded_x, mask)
 
@@ -380,6 +388,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )[:, None]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
+            # ЗАЩИТА ЗАПИСИ: координата взята из КОЛОНКИ ЗАПИСИ таблицы и, в отличие от
+            # координаты чтения выше, НИЧЕМ не проверялась. При спекуляции колонка записи
+            # уходит вперёд колонки чтения и может попасть в паддинговый хвост; тогда
+            # координата = pad_slot_id (-1) и запись уходит ДО начала тензора состояний --
+            # тихая порча чужой памяти, всплывающая позже в произвольном ядре.
+            if USE_PAD_SLOT:  # noqa
+                mask = mask & (conv_states_output_coord != pad_slot_id)
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
             tl.store(conv_states_ptrs_target, loaded_x, mask)
 
@@ -465,6 +480,58 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+_ОТКАЗЫ: dict = {}
+
+
+def _отказ(n):
+    if _СВЕРКА_FN and n not in _ОТКАЗЫ:
+        _ОТКАЗЫ[n] = 1
+        print(f"[ОТКАЗ-FN] причина №{n}", flush=True)
+    return None
+
+
+def _наше_conv_fn(x, weight, bias, conv_states, query_start_loc, cache_indices,
+                  has_initial_state, activation, pad_slot_id,
+                  block_idx_first_scheduled_token, block_idx_last_scheduled_token,
+                  initial_state_idx, num_computed_tokens, block_size_to_align):
+    """Наша причинная свёртка вместо чужой; None -- случай вне применимости."""
+    try:
+        if _наш_модуль is None or cache_indices is None or pad_slot_id is None:
+            return _отказ(1)
+        if query_start_loc is None or has_initial_state is None:
+            return _отказ(2)
+        # РАСКЛАДКА ЛЮБАЯ ИЗ ДВУХ: непрерывность по токенам ИЛИ по каналам
+        if x.dim() != 2 or (x.stride(1) != 1 and x.stride(0) != 1):
+            return _отказ(3)
+        if conv_states.dim() != 3 or conv_states.stride(1) != 1:
+            return _отказ(4)
+        if conv_states.dtype not in (torch.float16, torch.bfloat16):
+            return _отказ(5)
+        if x.dtype != conv_states.dtype or weight.dtype != conv_states.dtype:
+            return _отказ(6)
+        W = weight.size(1)
+        if W < 2 or W > 4:
+            return _отказ(7)
+        if activation not in (None, "silu", "swish"):
+            return _отказ(8)
+        табл = cache_indices
+        if табл.dim() == 1:
+            табл = табл.unsqueeze(1)
+        if табл.dtype != torch.int32 or has_initial_state.dtype != torch.bool:
+            return _отказ(9)
+        # промежуточные записи требуют И размера блока, И обеих колонок
+        if block_idx_last_scheduled_token is not None and int(block_size_to_align) <= 0:
+            if block_idx_first_scheduled_token is None:
+                return _отказ(10)
+        return _наш_модуль.conv1d_fn(
+            x, weight, bias, activation in ("silu", "swish"), conv_states,
+            has_initial_state, табл, block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token, initial_state_idx, num_computed_tokens,
+            int(block_size_to_align), query_start_loc, int(pad_slot_id))
+    except Exception:
+        return _отказ(11)
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -541,6 +608,31 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
+    if _НАШЕ_FN or _СВЕРКА_FN:
+        _наш = _наше_conv_fn(
+            x, weight, bias, conv_states, query_start_loc, cache_indices,
+            has_initial_state, activation, pad_slot_id,
+            block_idx_first_scheduled_token, block_idx_last_scheduled_token,
+            initial_state_idx, num_computed_tokens, block_size_to_align)
+        if _наш is not None and not _СВЕРКА_FN:
+            return _наш
+        if _наш is not None and _СВЕРКА_FN and _СВЕРКА_СЧЁТ[0] < 12:
+            # СВЕРКА ВНУТРИ СЕРВЕРА: считаем ОБА и печатаем расхождение с формами.
+            # Микрогейт проходит, а в бою качество ломается -- значит вызов иной.
+            _сост_наш = conv_states.clone()
+            _ст_чуж = conv_states.clone()
+            import torch as _t
+            _счёт = _СВЕРКА_СЧЁТ[0]; _СВЕРКА_СЧЁТ[0] += 1
+            print(f"[СВЕРКА-FN {_счёт}] x={tuple(x.shape)} шаги={x.stride()} "
+                  f"сост={tuple(conv_states.shape)} шаги={conv_states.stride()} "
+                  f"табл={tuple(cache_indices.shape) if cache_indices is not None else None} "
+                  f"qsl={tuple(query_start_loc.shape)} qsl[:6]={query_start_loc[:6].tolist()} "
+                  f"Bбл={block_size_to_align} W={weight.size(1)} "
+                  f"кп={None if block_idx_first_scheduled_token is None else block_idx_first_scheduled_token[:4].tolist()} "
+                  f"кз={None if block_idx_last_scheduled_token is None else block_idx_last_scheduled_token[:4].tolist()} "
+                  f"кч={None if initial_state_idx is None else initial_state_idx[:4].tolist()} "
+                  f"nc={None if num_computed_tokens is None else num_computed_tokens[:4].tolist()} "
+                  f"ест={None if has_initial_state is None else has_initial_state[:4].tolist()}", flush=True)
     out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
@@ -930,6 +1022,13 @@ def _causal_conv1d_update_kernel(
         idx_tokens * stride_conv_state_tok
     )[:, None]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+    # ЗАЩИТА ЗАПИСИ: координата взята из КОЛОНКИ ЗАПИСИ таблицы и, в отличие от
+    # координаты чтения выше, НИЧЕМ не проверялась. При спекуляции колонка записи
+    # уходит вперёд колонки чтения и может попасть в паддинговый хвост; тогда
+    # координата = pad_slot_id (-1) и запись уходит ДО начала тензора состояний --
+    # тихая порча чужой памяти, всплывающая позже в произвольном ядре.
+    if USE_PAD_SLOT:  # noqa
+        mask = mask & (conv_states_offset != pad_slot_id)
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
@@ -1066,6 +1165,79 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+# [СВОЁ ЯДРО СВЁРТКИ, 07.09] Подмена чужого Triton-ядра нашим нативным.
+# ЗАЧЕМ: (1) чужое не проверяет координату ЗАПИСИ -- наше проверяет ОБЕ координаты
+# и обе колонки, дыра закрыта формой кода; (2) чужое ходит по состоянию дважды с
+# двумя debug_barrier, наше -- один проход по регистрам, ноль барьеров: замерено
+# x10.1 при B=1 (боевой декод) и x1.54 при B=64; (3) пункт 5 цели -- нативный путь
+# вместо Triton в горячем пути.
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: venv общий с боевым, включать рычагом.
+_НАШЕ_ЯДРО = os.environ.get("FA2SM70_CONV_NATIVE", "0") == "1"
+_НАШЕ_FN = os.environ.get("FA2SM70_CONV_FN_NATIVE", "0") == "1"
+_СВЕРКА_FN = os.environ.get("FA2SM70_CONV_FN_CHECK", "0") == "1"
+_СВЕРКА_СЧЁТ = [0]
+_наш_модуль = None
+if _НАШЕ_ЯДРО:
+    # ГРУЗИТЬ ДО ЗАХВАТА ГРАФА, А НЕ ЛЕНИВО. Ленивая загрузка расширения при первом
+    # вызове попадает ВНУТРЬ захвата графа: JIT открывает .so и выделяет память, и
+    # эта память принадлежит пулу графа. Ровно на этом стенд упал 07.09 через минуту
+    # под нагрузкой. Третий случай того же класса за день.
+    try:
+        import fa2_sm70._ext as _e_conv
+        _наш_модуль = _e_conv.conv_ext()
+    except Exception as _e:
+        print(f"[СВОЯ СВЁРТКА] расширение не загрузилось, остаётся чужой путь: {_e}", flush=True)
+        _наш_модуль = None
+
+
+def _наше_conv_update(x, conv_state, weight, bias, activation, conv_state_indices,
+                      num_accepted_tokens, query_start_loc, max_query_len,
+                      pad_slot_id, block_idx_last_scheduled_token, initial_state_idx):
+    """Вернёт результат нашего ядра либо None, если случай вне области применимости.
+
+    ОТКАЗ ВОЗВРАЩАЕТ None, А НЕ БРОСАЕТ: предусловие формы обязано деградировать до
+    чужого пути, а не ронять воркер (закон, оплаченный падением боевого 16.08).
+    """
+    global _наш_модуль
+    try:
+        if conv_state_indices is None or pad_slot_id is None:
+            return None
+        if conv_state.dim() != 3 or conv_state.stride(1) != 1:
+            return None
+        if x.dim() != 2 or x.stride(-1) != 1 or x.dtype != conv_state.dtype:
+            return None
+        if conv_state.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        if weight.dtype != conv_state.dtype:
+            return None
+        W = weight.size(1)
+        if W < 2 or W > 6:
+            return None
+        if activation not in (None, "silu", "swish"):
+            return None
+        if _наш_модуль is None:
+            return None
+        табл = conv_state_indices
+        if табл.dim() == 1:
+            табл = табл.unsqueeze(1)
+        if табл.dtype != torch.int32:
+            return None
+        кч = initial_state_idx
+        кз = block_idx_last_scheduled_token
+        мдл = int(max_query_len) if query_start_loc is not None else 1
+        if query_start_loc is not None and мдл < 1:
+            return None
+        # окно = W-1 (без спекуляции) либо W-1+k-1 (со спекуляцией); больше 16 не поддержано
+        окно = (W - 1 + мдл - 1) if num_accepted_tokens is not None else (W - 1)
+        if окно > 16:
+            return None
+        return _наш_модуль.conv1d_update(
+            x, conv_state, weight, bias, activation in ("silu", "swish"),
+            табл, кч, кз, num_accepted_tokens, query_start_loc, мдл, int(pad_slot_id))
+    except Exception:
+        return None
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1129,6 +1301,13 @@ def causal_conv1d_update(
 
     original_x_dtype = x.dtype
     x = x.to(conv_state.dtype)
+    if _НАШЕ_ЯДРО:
+        _наш = _наше_conv_update(
+            x, conv_state, weight, bias, activation, conv_state_indices,
+            num_accepted_tokens, query_start_loc, max_query_len, pad_slot_id,
+            block_idx_last_scheduled_token, initial_state_idx)
+        if _наш is not None:
+            return _наш.to(original_x_dtype)
     unsqueeze = query_start_loc is None and x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1

@@ -52,7 +52,18 @@ async def create_score(request: ScoreRequest, raw_request: Request):
     try:
         generator = await handler.create_score(request, raw_request)
     except Exception as e:
-        return handler.create_error_response(e)
+        # [FA2/SM70 29.08] СТАТУС ОТВЕТА ОБЯЗАН СОВПАДАТЬ С ТЕЛОМ.
+        # Здесь возвращался ОБЪЕКТ ErrorResponse, а не JSONResponse -- и FastAPI отдавал его
+        # со статусом по умолчанию, то есть **HTTP 200 с телом ошибки**. Соседняя ветка того
+        # же роутера (`isinstance(generator, ErrorResponse)`) делает это правильно.
+        # Отказ по отчёту падений §8-тер.2: недоступный image_url -> 200 OK и
+        # {"error": {..., "code": 500}}. Любая совместимая с OpenAI библиотека на статусе 200
+        # исключения не поднимет и `choices` не найдёт -- клиент видит «пустой ответ».
+        _ошибка = handler.create_error_response(e)
+        return JSONResponse(
+            content=_ошибка.model_dump(),
+            status_code=getattr(getattr(_ошибка, "error", None), "code", 500) or 500,
+        )
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
@@ -103,7 +114,18 @@ async def do_rerank(request: RerankRequest, raw_request: Request):
     try:
         generator = await handler.do_rerank(request, raw_request)
     except Exception as e:
-        return handler.create_error_response(e)
+        # [FA2/SM70 29.08] СТАТУС ОТВЕТА ОБЯЗАН СОВПАДАТЬ С ТЕЛОМ.
+        # Здесь возвращался ОБЪЕКТ ErrorResponse, а не JSONResponse -- и FastAPI отдавал его
+        # со статусом по умолчанию, то есть **HTTP 200 с телом ошибки**. Соседняя ветка того
+        # же роутера (`isinstance(generator, ErrorResponse)`) делает это правильно.
+        # Отказ по отчёту падений §8-тер.2: недоступный image_url -> 200 OK и
+        # {"error": {..., "code": 500}}. Любая совместимая с OpenAI библиотека на статусе 200
+        # исключения не поднимет и `choices` не найдёт -- клиент видит «пустой ответ».
+        _ошибка = handler.create_error_response(e)
+        return JSONResponse(
+            content=_ошибка.model_dump(),
+            status_code=getattr(getattr(_ошибка, "error", None), "code", 500) or 500,
+        )
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

@@ -486,6 +486,10 @@ def apply_sampling_constraints(
             cu_num_draft_tokens,
             num_tokens,
         )
+        # [FA2/SM70 23.09] развёртка по токенам не меняет максимум -- переносим хозяйский kmax
+        _fa2_km = getattr(sampling_metadata.top_k, "_fa2_kmax", None)
+        if _fa2_km is not None:
+            top_k._fa2_kmax = _fa2_km
     top_p = None
     if sampling_metadata.top_p is not None:
         top_p = expand_batch_to_tokens(

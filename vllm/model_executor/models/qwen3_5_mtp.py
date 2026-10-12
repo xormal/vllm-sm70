@@ -404,10 +404,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         cache_config = vllm_config.cache_config
-        if cache_config.mamba_cache_mode == "all":
+        # [FA2/SM70, задача 194] Черновик MTP делит те же блоки состояний, что и главная
+        # сеть, и в режиме 'all' работает через ту же таблицу блоков. Рычаг -- общий.
+        import os as _os
+        if cache_config.mamba_cache_mode == "all" and \
+                _os.environ.get("FA2SM70_MAMBA_ALL", "0") != "1":
             raise NotImplementedError(
-                "Qwen3_5MTP currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
+                "Режим 'all' собран, но выключен: включается FA2SM70_MAMBA_ALL=1"
             )
 
         self.quant_config = vllm_config.quant_config

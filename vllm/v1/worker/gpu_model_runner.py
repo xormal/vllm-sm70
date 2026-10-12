@@ -3,8 +3,10 @@
 
 import functools
 import gc
+import os as _os
 import itertools
 import threading
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
@@ -154,6 +156,10 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+# [FA2/SM70 25.08] Свой предлагатель DFlash2: ОДИН проход на блок (у eagle -- цикл по k) и
+# отбор СВЯЗНОГО пути вместо поточечного argmax. Наследование от EagleProposer было бы
+# наследованием ровно того цикла, ради снятия которого метод и берётся.
+from vllm.v1.spec_decode.dflash2 import DFlash2Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -191,7 +197,123 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+# Флаг прибора слоёв читается ОДИН раз при загрузке: шаг декода -- горячий путь.
+_ДБГ_СЛОИ_ВКЛ = _os.environ.get("FA2SM70_DBG_LAYERS", "0") == "1"
+
 logger = init_logger(__name__)
+
+# Пропуск построения метаданных для группы черновика (см. _build_attn_group_metadata).
+_ПРОПУСК_МЕТЫ_ЧЕРНОВИКА = os.environ.get("FA2SM70_SKIP_DRAFT_META", "0") == "1"
+# [ПРИБОР ФАЗ -- КОНСТАНТА, 31.08] `int(os.environ.get("FA2SM70_STEP_PHASE"))` стояло в ДВАДЦАТИ
+# ОДНОМ месте горячего шага плюс внутри самого `_фаза_шага`: обращение к словарю окружения и
+# разбор строки на каждом, и всё это при ВЫКЛЮЧЕННОМ приборе. Окружение в рантайме не меняется.
+# [01.09] ВКЛЮЧЕНО ПО УМОЛЧАНИЮ. Это лечение обрыва на границе блока состояния,
+# который отчёт reports/vllm-granica-ne-ushla-2026-08-31.md фиксирует как НЕ ушедший
+# (5 событий на 23 генерациях, две точные подписи 4095 и 4097). Механизм: на шаге,
+# где k+1 черновых токенов переходят границу, спекуляция снимается и шаг идёт
+# обычным декодом, который границу проходит верно. Цена -- 5 шагов из 4096 (0.12 %).
+# Откат -- FA2SM70_GDN_GRAN_SKIP=0.
+_ГРАН_ПРОПУСК = os.environ.get("FA2SM70_GDN_GRAN_SKIP", "1") == "1"
+_ГРАН_ЛОГ = os.environ.get("FA2SM70_GDN_GRAN_LOG", "0") == "1"
+# Отброс бонусного токена у границы блока (записка 25 §123). Рычаг отката.
+# ОТБРОС БОНУСНОГО ТОКЕНА У ГРАНИЦЫ -- ГИПОТЕЗА ОПРОВЕРГНУТА ЗАМЕРОМ (04.09).
+# Обрыв объяснялся неверным бонусным токеном; правка исполнялась (пометка PLACEHOLDER
+# печаталась прибором), но обрывов осталось 7 из 20 против 9 из 20 -- шум. Настоящая
+# причина найдена в адресации состояния GDN у границы блока (FA2SM70_GRAN_SRC).
+# Рычаг оставлен выключенным: код рабочий, но лишний.
+_ГРАН_БОНУС = os.environ.get("FA2SM70_GRAN_BONUS", "0") == "1"
+# Контроль исполнимости: снимать черновик ВСЕГДА. Если при нём шаги всё равно идут с
+# q=k+1, значит правка черновика в этом месте на планирование не влияет вовсе.
+_ГРАН_ВСЕГДА = os.environ.get("FA2SM70_GRAN_ALL_OFF", "0") == "1"
+# Прибор границы: сверяет, что для КАЖДОЙ позиции шага блок уже выделен в таблице.
+# Если нет -- compute_slot_mapping возьмёт block_table[req, k] == 0, то есть KV уедет
+# в ЧУЖОЙ блок 0. Только стенд: печать в горячем пути.
+_ГРАН_СЛОТ = os.environ.get("FA2SM70_GRAN_SLOT", "0") == "1"
+# Ниже этого числа посчитанных токенов спекуляция не запускается: на вырожденном
+# контексте она даёт пустые ответы (отчёт 31.08, раздел 5). 0 -- выключить порог.
+_МИН_КОНТЕКСТ = int(os.environ.get("FA2SM70_SPEC_MINCTX", "32"))
+_ДЕРЕВО_W = int(os.environ.get("FA2SM70_TREE_W", "0"))
+# Фальсификатор: 1 = дерево строится и маскируется, но приёмке ВСЕГДА отдаётся
+# ветвь A. Отделяет вину маски/черновика от вины ВЫБОРА ветви.
+_ДЕРЕВО_ТОЛЬКО_A = os.environ.get("FA2SM70_TREE_ONLY_A", "0") == "1"
+# [ПРОСТОЙ КОНВЕЙЕРА, 07.09] Замерено: со спекуляцией GPU делает МЕНЬШЕ работы
+# (18-19 мс/шаг против 24.9 без неё), а шаг ВТРОЕ длиннее (43-60 против 22.2) --
+# значит 20 мс постоянной платы это ПРОСТОЙ, а не работа. Единственная блокирующая
+# синхронизация спекулятивной ветки -- снятие приёмки на хост в конце шага
+# (.cpu().numpy()), тогда как значение нужно только в НАЧАЛЕ следующего шага.
+# Рычаг убирает круг "GPU -> хост -> GPU": значение остаётся на устройстве.
+# ЗАЩИТА: путь применяется ТОЛЬКО когда состав батча не менялся (нет новых и нет
+# завершённых запросов) -- иначе индексы хозяйского массива и строк вывода
+# расходятся, и приёмка уедет не тому запросу.
+_БЕЗ_СИНХРО_ПРИЁМКИ = os.environ.get("FA2SM70_NOSYNC_ACC", "0") == "1"
+# [ВЫБОРКА ДЛЯ ПЕРЕРАНЖИРОВЩИКА, 07.09] Метка -- argmax ЦЕЛИ на позиции 0; вход --
+# скрытое состояние черновика и его 16 кандидатов. Всё это уже посчитано, платы нет.
+_ВЫБОРКА_ФАЙЛ = os.environ.get("FA2SM70_RERANK_DUMP", "")
+_ВЫБОРКА_ПРЕДЕЛ = int(os.environ.get("FA2SM70_RERANK_MAX", "60000"))
+# [БИСЕКЦИЯ 07.09] Биты режима покрывают conv, KV и off-сдвиг, но НЕ покрывают
+# подмену позиций и branch_at. Два недостающих рычага -- ровно для того, чтобы
+# отделить, что именно портит выход при включённом дереве.
+_ДЕРЕВО_БЕЗ_ПОЗ = os.environ.get("FA2SM70_TREE_NOPOS", "0") == "1"
+_ДЕРЕВО_СЧЁТ = int(os.environ.get("FA2SM70_TREE_COUNT", "0"))
+_ДЕРЕВО_ФАЙЛ = os.environ.get("FA2SM70_TREE_FILE", "")
+_ДЕРЕВО_ТАУ = int(os.environ.get("FA2SM70_TREE_TAU", "0"))
+# [ДЕРЕВО, 05.09] Принятие ветви B: сдвиг чтения состояний (через off-буфер qwen3_next)
+# и слот-копия KV внимания. Эксперимент: порядок строк батча между соседними шагами
+# предполагается неизменным (чистый спекулятивный декод).
+_ДЕРЕВО_КВ = os.environ.get("FA2SM70_TREE_KV", "0") == "1"
+_ДЕРЕВО_КВ_КОПИЯ = os.environ.get("FA2SM70_TREE_KV_COPY", "1") == "1"   # под-рычаг для бинарного поиска
+_ДЕРЕВО_OFF_ВКЛ = os.environ.get("FA2SM70_TREE_OFF", "1") == "1"        # off-сдвиг чтения SSM
+# [05.09-3] Умолчание 0: обе правки окна (полный своп из чернового и точечная копия
+# столбцов) в бою ДОБАВЛЯЮТ порчу (136 и 206 «!» против 8 без них), хотя по содержимому
+# верны (дозор окон) и на офлайн-тесте дают 6e-08. Взаимодействие 5- и 7-элементной
+# семантик окна между шагами не понято до конца -- чинить только после расширенного
+# офлайн-теста, воспроизводящего боевую пару вызовов на одном пуле.
+_ДЕРЕВО_CONV_SWAP = os.environ.get("FA2SM70_TREE_CONV_SWAP", "0") == "1" # подмена conv-окна
+# Сколько верхних логитов цели складывать для дистилляции черновика (0 = не собирать).
+_ЛОГИТЫ_ТОП = int(os.environ.get("FA2SM70_DFLASH2_TOPK", "0"))
+_ФАЗА_ШАГА_N = int(os.environ.get("FA2SM70_STEP_PHASE", "0"))
+# КОНСТАНТА, а не чтение окружения на каждый вызов -- см. пояснение к _ФАЗА_ШАГА_N выше.
+_ФАЗА_ДЕВ = int(os.environ.get("FA2SM70_STEP_PHASE_DEV", "0"))
+# [БЕЗ СИНХРОНИЗАЦИИ -- 09.09, записка 25 §255] Фаза «прямой проход цели» меряется с
+# `torch.cuda.synchronize()`, то есть под фазомером шаг СЕРИАЛИЗОВАН и щель между работой
+# карты и шагом не видна вовсе. Для разбора щели нужен прибор, который не перестраивает
+# конвейер: окна на событиях (`_фаза_карты`) его и не трогают, а вот эта синхронизация
+# трогает. Рычаг снимает её, оставляя окна.
+_ФАЗА_БЕЗ_СИНХР = int(os.environ.get("FA2SM70_STEP_PHASE_NOSYNC", "0"))
+# [СЪЁМ ДАННЫХ ДЛЯ ОБУЧЕНИЯ ГОЛОВЫ MTP -- 11.09] Признаки цели по ВСЕМ позициям префилла плюс
+# их токены. Почему здесь: голова MTP получает РОВНО этот тензор (`target_hidden_states`), то
+# есть собранное обучающее множество совпадает с боевым входом побайтово -- именно тот гейт,
+# которого не было у четырёх прежних заходов обучения черновика (записка 25: прибор двигали, а
+# вход с боем не совпадал НИ ОДНИМ звеном). Префилл даёт 3000 позиций за запрос против одной
+# за шаг декода, поэтому корпус собирается минутами, а не днями.
+# Умолчание ПУСТО: venv общий с боевым, и в выключенном виде это одна проверка строки на шаг.
+_ДАМП_MTP = os.environ.get("FA2SM70_MTP_DUMP", "")
+_ДАМП_MTP_МИН = int(os.environ.get("FA2SM70_MTP_DUMP_MINTOK", "512"))
+_ДАМП_MTP_N = [0]
+# [ОПИСЬ ПАМЯТИ -- 09.09] Между весами (13.5 ГиБ на ранг) и пулом KV (9.9) с одной стороны и
+# занятыми 31.4 ГиБ с другой -- восемь гигабайт неучтённых, а нам не хватает 303 МиБ под
+# int4-словарь черновика (§241). Печатаем разложение РАЗ, после первого шага: сколько торч
+# ДЕРЖИТ (reserved) против того, что реально занято (allocated) -- разница и есть то, что
+# распределитель не отдал драйверу. 0 = ветка мертва.
+_ОПИСЬ_ПАМЯТИ = int(os.environ.get("FA2SM70_MEM_DUMP", "0"))
+# [ВОЗВРАТ ДЕРЖАННОЙ ПАМЯТИ -- 09.09] Опись показала: распределитель торча ДЕРЖИТ 30.75 ГиБ,
+# а занято 29.73 -- гигабайт свободных блоков, которые он не отдаёт драйверу, при том что у
+# драйвера свободно 0.34. Из-за этого не помещался int4-словарь черновика (303 МиБ, +9 %
+# декода, §241) и падала игла на 128K. Разовый `empty_cache` ПОСЛЕ захвата графов возвращает
+# эти блоки: графы уже сняты, пул KV выделен, а транзиентные буферы прогрева больше не нужны.
+# Делается ОДИН раз на первом шаге и печатает до/после -- чтобы приз был виден, а не заявлен.
+_ВОЗВРАТ_ПАМЯТИ = os.environ.get("FA2SM70_MEM_TRIM", "0") == "1"
+# [ПОДРЕЗКА ПО ПОРОГУ -- 09.09, записка 25 §252] Разовый возврат после захвата не помогает:
+# дробление КОПИТСЯ во время длинного префилла (чанки по 4096 дают буферы разного размера).
+# Отказ иглы на 128K при включённом int4-словаре был именно такой: «не хватило 52 МиБ, при
+# 809 МиБ держанных и НЕиспользованных». Здесь возврат делается ПЕРЕД шагом префилла, когда
+# держанного-но-свободного больше порога. Обе величины берутся у распределителя БЕЗ
+# синхронизации с картой, поэтому проверка стоит наносекунды; сам `empty_cache` зовётся
+# редко и только на префилле, где он тонет в сотнях миллисекунд работы.
+_ПОДРЕЗ_МиБ = int(os.environ.get("FA2SM70_MEM_TRIM_MB", "0"))
+# Порог по числу токенов шага: ниже него распределитель не опрашивается вовсе. Декодный шаг со
+# спекуляцией это (k+1)*запросов, то есть десятки; префилльный чанк -- тысячи.
+_ПОДРЕЗ_ТОКЕНОВ = int(os.environ.get("FA2SM70_MEM_TRIM_MINTOK", "512"))
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -208,9 +330,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        # [ГРАНИЦА БЛОКА, 04.09] Разбор выдачи спекуляции при асинхронном планировании идёт
+        # ЗДЕСЬ, а не в бегунке, и объекту вывода недоступны ни контекст запросов, ни размер
+        # блока -- их приходится передать снимком на момент шага.
+        гран_ctx: list[int] | None = None,
+        гран_B: int = 0,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._гран_ctx = гран_ctx
+        self._гран_B = гран_B
+        self._гран_снят = 0
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -235,6 +365,46 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
             self.async_copy_ready_event.record()
 
+    def _гран_бонус_пометить(self, тензор):
+        """Помечает БОНУСНЫЙ токен отвергнутым у строк, чьи позиции пересекли границу блока.
+
+        Бонусный -- последний НЕотвергнутый в строке: целевая модель считает его на позиции
+        последнего принятого, и когда та легла по другую сторону границы, он приходит неверным
+        (обычно EOS, отсюда `finish_reason=stop` посреди слова). Строка, где принят только он
+        сам, не трогается -- иначе шаг не выдал бы ни одного токена.
+
+        Тензор выдачи -- INFERENCE-тензор: запись в него на месте запрещена (RuntimeError),
+        поэтому строки сперва отбираются, и лишь при непустом отборе делается клон. На шагах
+        без границы (99.98 %) не копируется ничего.
+        """
+        # PLACEHOLDER_TOKEN_ID живёт в rejection_sampler (значение -1), не в metadata.
+        from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID as _PH
+        B = self._гран_B
+        ctx_все = self._гран_ctx
+        n = min(int(тензор.shape[0]), len(ctx_все))
+        отбор = []
+        for i in range(n):
+            годных = int((тензор[i] != _PH).sum())
+            if годных < 2:
+                continue
+            ctx = int(ctx_все[i])
+            if ctx <= 0:
+                continue
+            # Позиции шага: ctx .. ctx+годных-1. Бонусный посчитан на ctx+годных-1.
+            if ctx // B != (ctx + годных - 1) // B:
+                отбор.append((i, годных))
+        if not отбор:
+            return тензор
+        тензор = тензор.clone()
+        for i, годных in отбор:
+            тензор[i, годных - 1] = _PH
+        self._гран_снят += len(отбор)
+        if _ГРАН_ЛОГ:
+            import sys as _s3
+            print(f"[ГРАНИЦА] бонусный токен отброшен у {len(отбор)} строк: "
+                  f"{отбор} B={B} всего={self._гран_снят}", file=_s3.stderr, flush=True)
+        return тензор
+
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
@@ -254,14 +424,32 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             if self._logprobs_tensors_cpu is not None:
                 logprobs_lists = self._logprobs_tensors_cpu.tolists()
         else:
+            # [ГРАНИЦА БЛОКА -- ОТБРОС БОНУСНОГО ТОКЕНА, 04.09] Пометка делается В ТЕНЗОРЕ,
+            # до разбора: `parse_output` отфильтрует PLACEHOLDER штатно, и счётчики принятых
+            # (они считаются из этого же тензора) остаются согласованными. Первая редакция
+            # удаляла токен из готового списка -- движок вис на рассинхроне счётчиков.
+            _выдача = self.sampled_token_ids_cpu
+            if _ГРАН_БОНУС and self._гран_ctx and self._гран_B:
+                _выдача = self._гран_бонус_пометить(_выдача)
             valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
-                self.sampled_token_ids_cpu,
+                _выдача,
                 self.vocab_size,
                 self._invalid_req_indices,
                 logprobs_tensors=self._logprobs_tensors_cpu,
             )
 
         output = self._model_runner_output
+        # [ГРАНИЦА БЛОКА -- ОТБРОС БОНУСНОГО ТОКЕНА, 04.09]
+        # Диагноз (записка 25 §121b): спекуляция даёт ТОТ ЖЕ текст, что обычный декод, но
+        # преждевременно завершает его -- приходит лишний EOS, и `check_stop` обрывает запрос
+        # (`finish_reason=stop`, текст оборван посреди слова, сумма кратна block_size).
+        # Последний столбец выдачи rejection sampler -- БОНУСНЫЙ токен: его целевая модель
+        # считает на позиции последнего ПРИНЯТОГО. Когда k+1 позиций легли по обе стороны
+        # границы блока, KV этой позиции читается из блока, который на этом шаге ещё не
+        # согласован, и бонусный токен получается неверным -- чаще всего EOS.
+        # Лечение точечное: на таком шаге бонусный токен отбрасывается, принятые остаются.
+        # Следующий шаг пересчитает его уже внутри нового блока. Цена -- один токен на
+        # block_size, то есть 0.02 %, и никакого влияния на скорость: работа уже сделана.
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
         return output
@@ -447,10 +635,29 @@ class GPUModelRunner(
                 NgramProposer  # noqa: F823
                 | SuffixDecodingProposer
                 | EagleProposer
+                | DFlash2Proposer
                 | DraftModelProposer
                 | MedusaProposer
             )
-            if self.speculative_config.method == "ngram":
+            if self.speculative_config.method == "dflash2":
+                # [FA2/SM70 25.08] ПОЛНАЯ вторая версия: блок за один проход + связывание позиций
+                # селектором (точный путь по цепи). Сведение чекпойнта к V1 теряло селектор.
+                self.drafter = DFlash2Proposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = getattr(
+                    self.drafter, "eagle3_use_aux_hidden_state", True
+                )
+            elif self.speculative_config.method == "dflash":
+                # [FA2/SM70 24.08] Блочно-диффузионный черновик: k токенов за ОДИН проход, вместо
+                # k последовательных. Наш замер показал, что именно последовательность проходов
+                # съедает выигрыш спекуляции (14.3 мс НА ПРОХОД), а у этого черновика ещё и
+                # скользящее окно 2048 -- значит его цена НЕ РАСТЁТ с длиной контекста.
+                from vllm.v1.spec_decode.dflash import DFlashProposer
+
+                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = getattr(
+                    self.drafter, "eagle3_use_aux_hidden_state", True
+                )
+            elif self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
@@ -1149,11 +1356,62 @@ class GPUModelRunner(
             )
             .int()
             .argmax(-1)
-            .cpu()
-            .numpy()
         )
-        for i, num_tokens in enumerate(num_accepted_tokens):
-            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+        _стабилен = (not getattr(scheduler_output, "scheduled_new_reqs", None)
+                     and not getattr(scheduler_output, "finished_req_ids", None))
+        if _БЕЗ_СИНХРО_ПРИЁМКИ and _стабилен:
+            self._приёмка_gpu = num_accepted_tokens
+            num_accepted_tokens = None
+        else:
+            self._приёмка_gpu = None
+            num_accepted_tokens = num_accepted_tokens.cpu().numpy()
+            for i, num_tokens in enumerate(num_accepted_tokens):
+                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+        # [СЧЁТЧИК ОБМЕНА, 07.09] Читается ЗДЕСЬ, потому что питон движка исполняется
+        # каждый шаг (в граф уходит только проход сети). Счётчик живёт В ЯДРЕ и потому
+        # считает и повторы графа -- со стороны питона это единственный способ.
+        if os.environ.get("FA2SM70_GDN_GUARD", "0") == "1":
+            # [ПРОВЕРКА ГРАНИЦ СОСТОЯНИЯ] Ядро-проверка идёт В ГРАФЕ и считает
+            # нарушения на каждом повторе; здесь их только читают. Первое нарушение
+            # запоминается целиком -- оно и есть улика к скрытому падению.
+            _ш2 = getattr(self, "_гр_шагов", 0) + 1
+            self._гр_шагов = _ш2
+            if _ш2 % 100 == 0:
+                try:
+                    import fa2_sm70._ext as _е2
+                    _н, _зн, _поз, _пр, _вид = _е2.gdn_ext().gdn_check_read(False)
+                    # ПЕЧАТЬ БЕЗУСЛОВНАЯ. Прошлый прогон промолчал целиком, и его
+                    # молчание нельзя было прочесть как "нарушений нет": живость
+                    # прибора обязана доказываться числом, а не предполагаться.
+                    print(f"[GDN ГРАНИЦЫ] шаг {_ш2}: нарушений {_н}"
+                          + (f" ПЕРВОЕ значение={_зн} позиция={_поз} предел={_пр}"
+                             if _н else " (чисто)"),
+                          file=__import__("sys").stderr, flush=True)
+                except Exception as _e3:
+                    print(f"[GDN ГРАНИЦЫ] чтение не удалось: {_e3}",
+                          file=__import__("sys").stderr, flush=True)
+        if os.environ.get("FA2SM70_AR2_COUNT", "0") == "1":
+            _ш = getattr(self, "_ar2_шагов", 0) + 1
+            self._ar2_шагов = _ш
+            if _ш % 200 == 0:
+                try:
+                    import fa2_sm70._ext as _е
+                    _c, _e2 = _е.exch_ext().ar2_counter_read(False)
+                    print(f"[AR2 ЯДРО] шагов {_ш} запусков {_c} = {_c/_ш:.1f} на шаг",
+                          file=__import__("sys").stderr, flush=True)
+                except Exception as _ex:
+                    print(f"[AR2 ЯДРО] чтение не удалось: {_ex}",
+                          file=__import__("sys").stderr, flush=True)
+        # [АВТОСПЕКУЛЯЦИЯ] Скользящее среднее tau. Значение УЖЕ на процессоре
+        # (строкой выше его и так снимают), поэтому лишней синхронизации нет.
+        try:
+            if len(num_accepted_tokens):
+                _т = float(sum(num_accepted_tokens)) / len(num_accepted_tokens)
+                from vllm.v1.spec_decode import dflash2 as _дф
+                _дф.ПРИЁМКА_СРЕДН[0] = (0.95 * _дф.ПРИЁМКА_СРЕДН[0] + 0.05 * _т
+                                        if _дф.ПРИЁМКА_СРЕДН[0] > 0 else _т)
+        except Exception:
+            pass
         if self.cache_config.mamba_cache_mode == "align":
             mamba_utils.postprocess_mamba(
                 scheduler_output,
@@ -1383,6 +1641,12 @@ class GPUModelRunner(
         # Scatter the draft tokens after the sampled tokens are scattered.
         if self._draft_token_ids is None or not spec_flattened_indices:
             return
+        # [ПЕРЕХОД НА БЕЗ-СПЕКУЛЯЦИИ, 07.09] Автопереключатель приёмки может отдать
+        # ПУСТОЙ черновик, а планировщик на этом шаге ещё держит индексы прошлого.
+        # Индексация пустого тензора роняет воркер (IndexError: size 0). Переход
+        # между режимами обязан быть безболезненным: нечего рассыпать -- выходим.
+        if self._draft_token_ids.numel() == 0:
+            return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
         draft_tokens_index_tensor = torch.tensor(
@@ -1562,6 +1826,24 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        if _ГРАН_СЛОТ:
+            self._гран_слот_проверить(req_indices, positions_np, num_reqs)
+
+        # [ДЕРЕВО, ШАГ 4] ПОЗИЦИИ ВЕТВИ B -- ПОСЛЕ РАСЧЁТА СЛОТОВ, И ЭТО СУЩЕСТВЕННО.
+        # Строка W+1+j физически стоит на позиции база+W+1+j, а логически обязана стоять там
+        # же, где её двойник a(j) -- на база+1+j: обе ветви расходятся ИЗ ОДНОЙ точки. RoPE
+        # берёт позицию, поэтому без правки b0 считается не там, где a0, и предсказания цели в
+        # строках ветви B неверны -- приёмка сверяется с испорченным argmax.
+        # Правка идёт ПОСЛЕ compute_slot_mapping намеренно: слоты обязаны остаться
+        # ФИЗИЧЕСКИМИ (иначе обе ветви пишут KV в одни слоты и побеждает случайная), а RoPE --
+        # получить логические. Разведение этих двух ролей позиции и есть весь приём.
+        if _ДЕРЕВО_W > 0 and not _ДЕРЕВО_БЕЗ_ПОЗ:
+            _qд = 2 * _ДЕРЕВО_W + 1
+            if (total_num_scheduled_tokens % _qд == 0
+                    and int(num_scheduled_tokens.max()) == _qд
+                    and int(num_scheduled_tokens.min()) == _qд):
+                _pv = positions_np.reshape(-1, _qд)
+                _pv[:, _ДЕРЕВО_W + 1:] = _pv[:, 1:_ДЕРЕВО_W + 1]
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1704,12 +1986,23 @@ class GPUModelRunner(
         else:
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
+        _тм1 = time.perf_counter()
         if use_spec_decode:
-            self.num_accepted_tokens.np[:num_reqs] = (
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-            )
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            _пг = getattr(self, "_приёмка_gpu", None)
+            if _пг is not None and _пг.numel() >= num_reqs:
+                _цель = self.num_accepted_tokens.gpu
+                _цель[:num_reqs].copy_(_пг[:num_reqs].to(_цель.dtype))
+                _цель[num_reqs:].fill_(1)
+                self._приёмка_gpu = None
+            else:
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+                self.num_accepted_tokens.np[num_reqs:].fill(1)
+                self.num_accepted_tokens.copy_to_gpu()
+        if _ФАЗА_ШАГА_N:
+            self._фаза_шага("    мета: приёмка+H2D", time.perf_counter() - _тм1)
+        _тм2 = time.perf_counter()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -1791,6 +2084,19 @@ class GPUModelRunner(
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+            # [ДУБЛЬ МЕТАДАННЫХ ЧЕРНОВИКА -- ПРОПУСК ПОД РЫЧАГОМ, 31.08]
+            # Прибор формы шага (с именем группы) показал: за шаг цель строит метаданные ОДИН
+            # раз, черновик -- ТРИ, из них два вызова с идентичными параметрами. Разбор: от
+            # черновиковой группы раннеру нужен только `cm` (из него берётся
+            # `spec_decode_common_attn_metadata`), а результат `builder.build` кладётся в
+            # словарь по слоям, которые в проходе ЦЕЛИ не вызываются: черновик строит свои
+            # метаданные (`build_for_drafting`) и разворачивает СВОЙ set_forward_context.
+            # Умолчание ВЫКЛЮЧЕНО: цена 0.15 мс при шаге 43 мс, а место горячее -- включать
+            # только после гейта тождества выдачи И проверки, что приёмка не просела.
+            if _ПРОПУСК_МЕТЫ_ЧЕРНОВИКА and getattr(self, "drafter", None) is not None:
+                _имена = getattr(self.drafter, "attn_layer_names", None)
+                if _имена and _имена[0] in attn_group.layer_names:
+                    return
             builder = attn_group.get_metadata_builder(ubid or 0)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -1821,17 +2127,63 @@ class GPUModelRunner(
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
+                _туб = time.perf_counter()
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
                     common_attn_metadata.block_table_tensor,
                     common_attn_metadata.slot_mapping,
                 )
+                if _ФАЗА_ШАГА_N:
+                    self._фаза_шага(f"    upd:{type(builder).__name__}",
+                                    time.perf_counter() - _туб)
+                # [FA2/SM70 25.08] ПОБИТОВАЯ СВЕРКА ДВУХ ДОРОГ (FA2SM70_META_CHECK=N).
+                # Быстрый путь `update_block_table` уже РАЗ провалил гейт («39» вместо «391»), и
+                # формой это не ловилось. Здесь строим ОБА варианта и сравниваем ПОЛЕ ЗА ПОЛЕМ,
+                # а в работу отдаём медленный (заведомо верный). Так расхождение НАЗЫВАЕТСЯ, а не
+                # угадывается.
+                _пров = int(os.environ.get("FA2SM70_META_CHECK", "0"))
+                if _пров and getattr(self, "_мета_сверок", 0) < _пров:
+                    self._мета_сверок = getattr(self, "_мета_сверок", 0) + 1
+                    _эталон = builder.build(
+                        common_prefix_len=cascade_attn_prefix_len,
+                        common_attn_metadata=common_attn_metadata,
+                        **extra_attn_metadata_args,
+                    )
+                    _разн = []
+                    for _поле in getattr(_эталон, "__dataclass_fields__", {}):
+                        _a = getattr(attn_metadata_i, _поле, None)
+                        _b = getattr(_эталон, _поле, None)
+                        if isinstance(_b, torch.Tensor) or isinstance(_a, torch.Tensor):
+                            if _a is None or _b is None:
+                                _разн.append(f"{_поле}: {'нет' if _a is None else 'есть'} против "
+                                             f"{'нет' if _b is None else 'есть'}")
+                            elif _a.shape != _b.shape:
+                                _разн.append(f"{_поле}: форма {tuple(_a.shape)} != {tuple(_b.shape)}")
+                            elif not torch.equal(_a, _b):
+                                _разн.append(f"{_поле}: ЗНАЧЕНИЯ различаются "
+                                             f"({int((_a != _b).sum())} из {_a.numel()})")
+                        else:
+                            try:
+                                _равно = bool(_a == _b)
+                            except Exception:  # noqa: BLE001 - словари/списки тензоров
+                                _равно = (repr(_a) == repr(_b))
+                            if not _равно:
+                                _разн.append(f"{_поле}: {str(_a)[:40]} != {str(_b)[:40]}")
+                    logger.info("[fa2_sm70 СВЕРКА МЕТА %d] %s", self._мета_сверок,
+                                "; ".join(_разн) if _разн else "СОВПАЛО ПОЛЕ В ПОЛЕ")
+                    attn_metadata_i = _эталон  # в работу -- заведомо верный
             else:
+                _тб2 = time.perf_counter()
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+                if _ФАЗА_ШАГА_N:
+                    self._фаза_шага(
+                        f"    build:{type(builder).__name__}",
+                        time.perf_counter() - _тб2,
+                    )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
@@ -1845,6 +2197,10 @@ class GPUModelRunner(
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
+        if _ФАЗА_ШАГА_N:
+            self._фаза_шага("    мета: cm_base+таблицы", time.perf_counter() - _тм2)
+        _тм3 = time.perf_counter()
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
@@ -1853,6 +2209,7 @@ class GPUModelRunner(
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
+            _тгр = time.perf_counter()
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
                 num_scheduled_tokens or {},
                 kv_cache_group.kv_cache_spec,
@@ -1862,14 +2219,23 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("    мета: таблица+encoder", time.perf_counter() - _тгр)
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, EagleProposer):
+                if isinstance(self.drafter, EagleProposer | DFlash2Proposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
 
+            if _ФАЗА_ШАГА_N and not getattr(self, "_описано_групп", False):
+                self._описано_групп = True
+                for _g, _гр in enumerate(self.attn_groups):
+                    for _a, _агр in enumerate(_гр):
+                        _b = _агр.get_metadata_builder(0)
+                        logger.info("[fa2_sm70 ГРУППЫ] kv-группа %d, подгруппа %d: %s, слоёв %d",
+                                    _g, _a, type(_b).__name__, len(_агр.layer_names))
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
                     for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
@@ -1877,6 +2243,9 @@ class GPUModelRunner(
 
                 else:
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+
+        if _ФАЗА_ШАГА_N:
+            self._фаза_шага("    мета: цикл групп", time.perf_counter() - _тм3)
 
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
@@ -2844,6 +3213,105 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    # [FA2/SM70 25.08] ФАЗОМЕР ШАГА (FA2SM70_STEP_PHASE=N -- печать каждые N шагов).
+    # Замер снятием фазы показал: включение спекуляции стоит +16.7 мс НА ШАГ ещё до всякой
+    # полезной работы (пустой черновик, q=2: 46.6 мс против 29.9 без спекуляции). GDN (1.3 мс) и
+    # линейные тела (x1.20 при M=4) этого не объясняют -- значит статья в самом шаге движка,
+    # и её надо НАЗВАТЬ, а не угадать.
+    def _снять_для_головы(self, признаки: torch.Tensor, токены: torch.Tensor) -> None:
+        """Кладёт (признаки, токены) префилла на диск для обучения головы MTP.
+
+        Пишет ТОЛЬКО ранг 0: при TP=2 признаки уже сведены и на рангах одинаковы, вторая копия
+        была бы мусором на 10 ГБ. Отказ записи НЕ роняет шаг -- съём это прибор, а не условие.
+        """
+        try:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank as _ранг
+            if _ранг() != 0:
+                return
+        except Exception:
+            return          # не смогли опознать ранг -- лучше НЕ писать, чем писать вдвое
+        try:
+            import os as _os
+            _os.makedirs(_ДАМП_MTP, exist_ok=True)
+            _n = _ДАМП_MTP_N[0]
+            _ДАМП_MTP_N[0] = _n + 1
+            torch.save({"h": признаки.detach().to(torch.float16).cpu(),
+                        "t": токены.detach().to(torch.int32).cpu()},
+                       _os.path.join(_ДАМП_MTP, f"kusok_{_os.getpid()}_{_n:06d}.pt"))
+            if _n in (0, 9, 99, 999):
+                print(f"[fa2_sm70 СЪЁМ MTP] кусков {_n + 1}, позиций в этом {признаки.shape[0]}",
+                      file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[fa2_sm70 СЪЁМ MTP] отказ записи: {e}", file=sys.stderr, flush=True)
+
+    def _фаза_карты(self, имя: str):
+        """ФАЗА НА КАРТЕ, а не на хозяине. Возвращает менеджер контекста.
+
+        ЗАЧЕМ. Прежний `_фаза_шага` меряет `perf_counter` вокруг вызова, то есть время
+        ВЫДАЧИ ядер: проход асинхронный, хозяин возвращается сразу. Положительный контроль
+        27.08 это доказал -- вставка заведомых 5 мс внутрь прохода (`torch.cuda._sleep`)
+        подняла ПЕРИОД 44.28 -> 47.01, а фазу «прямой проход цели» не сдвинула вовсе
+        (31.01 -> 31.02). Значит все раскладки по фазам были про ХОЗЯИНА, а не про карту.
+        Здесь время берётся СОБЫТИЯМИ CUDA -- они лежат в потоке и меряют именно карту.
+        Включение: FA2SM70_STEP_PHASE_DEV=1 (вместе с FA2SM70_STEP_PHASE=N для печати).
+        """
+        import contextlib
+
+        if not _ФАЗА_ДЕВ:
+            return contextlib.nullcontext()
+
+        runner = self
+
+        @contextlib.contextmanager
+        def _окно():
+            пара = getattr(runner, "_соб_пул", None)
+            if пара is None:
+                пара = runner._соб_пул = {}
+            если = пара.get(имя)
+            if если is None:
+                если = пара[имя] = (torch.cuda.Event(enable_timing=True),
+                                    torch.cuda.Event(enable_timing=True))
+            если[0].record()
+            try:
+                yield
+            finally:
+                если[1].record()
+                # Читаем ПРОШЛУЮ пару: синхронизация здесь убила бы то, что меряем.
+                прошл = getattr(runner, "_соб_готово", None)
+                if прошл is None:
+                    прошл = runner._соб_готово = {}
+                гот = прошл.get(имя)
+                if гот is not None and гот[1].query():
+                    runner._фаза_шага("[карта] " + имя, гот[0].elapsed_time(гот[1]) / 1e3)
+                прошл[имя] = если
+                пара[имя] = (torch.cuda.Event(enable_timing=True),
+                             torch.cuda.Event(enable_timing=True))
+
+        return _окно()
+
+    def _фаза_шага(self, имя: str, дт: float) -> None:
+        н = _ФАЗА_ШАГА_N
+        if not н:
+            return
+        д = getattr(self, "_фазы_шага", None)
+        if д is None:
+            д = self._фазы_шага = {}
+            self._фазы_шага_счёт = 0
+        д[имя] = д.get(имя, 0.0) + дт * 1e3
+        if имя == "выборка+отбраковка":
+            self._фазы_шага_счёт += 1
+            if self._фазы_шага_счёт % н == 0:
+                c = н  # ОКНО, а не вся история: иначе средние загрязнены префилльными шагами,
+                # где проход в разы дороже декодного (проверено -- расхождение вчетверо).
+                стр = "  ".join(f"{и}={в / c:.2f}" for и, в in sorted(д.items(), key=lambda x: -x[1]))
+                logger.info(
+                    "[fa2_sm70 ФАЗЫ ШАГА, мс/шаг, окно %d] %s | ПЕРИОД макс=%.1f сумма=%.2f с за %d заходов",
+                    c, стр, getattr(self, "_пер_макс", 0.0) * 1e3,
+                    getattr(self, "_пер_сумма", 0.0), getattr(self, "_пер_счёт", 0),
+                )
+                self._пер_макс = 0.0
+                д.clear()
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -2866,13 +3334,289 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # [СБОР ЛОГИТОВ ЦЕЛИ ДЛЯ ДИСТИЛЛЯЦИИ ЧЕРНОВИКА -- 01.09]
+        # Обучение по ПРИНЯТЫМ ТОКЕНАМ вышло на плато (записка 25 §94d): один правильный ответ
+        # на позицию несёт слишком мало сигнала. Черновик обязан воспроизводить РАСПРЕДЕЛЕНИЕ
+        # цели, поэтому собираем top-k её логитов -- 64 значения с индексами это 512 байт на
+        # позицию, то есть корпус ДЕШЕВЛЕ нынешнего. Ветка мертва без переменной.
+        if _ЛОГИТЫ_ТОП:
+            try:
+                _зн, _ид = logits.topk(_ЛОГИТЫ_ТОП, dim=-1)
+                self._fa2_логиты = (_зн.detach().to("cpu", torch.float16),
+                                    _ид.detach().to("cpu", torch.int32))
+            except Exception:
+                self._fa2_логиты = None
+        _смд = spec_decode_metadata
+        if _ДЕРЕВО_W > 0:
+            _смд = self._дерево_ветвь(spec_decode_metadata, logits) or spec_decode_metadata
         sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
+            _смд,
             None,  # draft_probs
             logits,
             sampling_metadata,
         )
         return sampler_output
+
+    def _дерево_ветвь(self, smd, logits):
+        """[ДЕРЕВО, ШАГ 3] ВЫБОР ВЕТВИ ДО ПРИЁМКИ.
+
+        Приёмка vLLM линейна по построению: ядро идёт по цепи и встаёт на первом несовпадении.
+        Ветвление в неё не вписать -- но и не нужно. Черновик отдаёт 2W токенов как ДВЕ ветви
+        по W (ветвление на позиции 0), а здесь выбирается та ветвь, чей первый токен совпал с
+        выбором цели, и приёмке подаётся уже ЦЕПЬ. Собственное ядро приёмки не требуется.
+
+        Приёмка сама отбирает строки по `target_logits_indices`, поэтому переставляются ИНДЕКСЫ,
+        а тензор логитов не трогается вовсе.
+        """
+        W = _ДЕРЕВО_W
+        nd = smd.num_draft_tokens
+        if not nd or any(n != 2 * W for n in nd):
+            return None  # форма не наша (префилл, разнобой) -- идём цепью
+        B = len(nd)
+        dev = logits.device
+        tli = smd.target_logits_indices.view(B, 2 * W)
+        dti = smd.draft_token_ids.view(B, 2 * W)
+        # Что цель хочет на позиции 0. Строка tli[:,0] -- та самая позиция; у ветви B строка
+        # tli[:,W] стоит на ТОЙ ЖЕ позиции и с тем же контекстом (b0 видит лишь якорь).
+        t0 = logits[tli[:, 0]].argmax(dim=-1).to(dti.dtype)
+        берём_B = (dti[:, W] == t0) & (dti[:, 0] != t0)
+        if _ДЕРЕВО_СЧЁТ:
+            # ФАЛЬСИФИКАТОР ПРИЗА: считаем, ЧТО дало бы дерево, ничего не меняя в выдаче.
+            # Три числа: шагов всего; шагов, где ветвь A угадала позицию 0; шагов, где её
+            # угадала ТОЛЬКО ветвь B (это и есть чистая прибавка дерева).
+            self._дер_шагов = getattr(self, "_дер_шагов", 0) + B
+            self._дер_A = getattr(self, "_дер_A", 0) + int((dti[:, 0] == t0).sum())
+            self._дер_B = getattr(self, "_дер_B", 0) + int(берём_B.sum())
+            if self._дер_шагов % _ДЕРЕВО_СЧЁТ < B:
+                n = self._дер_шагов
+                import sys as _s
+                print(f"[ДЕРЕВО-ПРИЗ {n} shagov] A_ugadala={self._дер_A / n * 100:.1f}%  "
+                      f"tolko_B={self._дер_B / n * 100:.1f}%  "
+                      f"vmeste={(self._дер_A + self._дер_B) / n * 100:.1f}%",
+                      file=_s.stderr, flush=True)
+        if _ДЕРЕВО_ФАЙЛ:
+            # Переключатель без перезапуска: 0 = только ветвь A, 1 = дерево с выбором.
+            self._дер_опрос = getattr(self, "_дер_опрос", 0) + 1
+            if self._дер_опрос % 24 == 1:
+                # РЕЖИМ -- БИТОВАЯ МАСКА, ЧТОБЫ БИСЕКЦИЯ ШЛА В ОДНОМ ПОДЪЁМЕ.
+                # Качество сравнимо только внутри одного подъёма (тюнер GEMM
+                # свой у каждого), а рычагов у дерева три. Поэтому файл несёт
+                # число: бит0 -- ветвь B вообще; бит1 -- ЗАПРЕТ подмены conv-окна;
+                # бит2 -- ЗАПРЕТ копии KV; бит3 -- ЗАПРЕТ off-сдвига чтения SSM.
+                try:
+                    with open(_ДЕРЕВО_ФАЙЛ) as _f:
+                        self._дер_реж = int(_f.read(8).strip() or "0")
+                except Exception:
+                    self._дер_реж = 0
+            if not (getattr(self, "_дер_реж", 0) & 1):
+                берём_B = torch.zeros_like(берём_B)
+        elif _ДЕРЕВО_ТОЛЬКО_A:
+            берём_B = torch.zeros_like(берём_B)
+        # БИТ 7 -- ПРИНУДИТЕЛЬНОЕ ВЕТВЛЕНИЕ ДЛЯ ГЕЙТА ТОЖДЕСТВА. При FA2SM70_TREE_GATE=1
+        # ветвь B несёт ТОТ ЖЕ токен, что и A, и строки совпадают побайтово (гейт
+        # прошёл: max|a-b|=0). Тогда подмена окна пишет ЗАВЕДОМО ТО ЖЕ содержимое, и
+        # порча означала бы, что вредит САМО действие (адрес, поток, время), а не
+        # содержимое. Без принуждения условие (a0 != t0) на тождестве не выполнимо.
+        _рж = getattr(self, "_дер_реж", 0) if _ДЕРЕВО_ФАЙЛ else 0
+        if (_рж & 1) and (_рж & 128):
+            берём_B = (dti[:, W] == t0)
+        if _ДЕРЕВО_КВ:
+            self._дерево_принять_B(берём_B, W, B, smd)
+        # РАСКЛАДКА СТРОК ШАГА: [якорь, a0..a(W-1), b0..b(W-1)], и строка i даёт предсказание
+        # ПОСЛЕ токена этой строки. Отсюда:
+        #   ветвь A: позиции берут строки [якорь, a0, a1] = tli[0], tli[1], tli[2]; бонус tli[W]
+        #   ветвь B: позиции берут строки [якорь, b0, b1] = tli[0], tli[W+1], tli[W+2];
+        #            бонус -- исходный bonus_logits_indices (строка после b(W-1))
+        # ПЕРВЫЙ элемент у обеих ветвей ОДИН И ТОТ ЖЕ -- строка якоря: обе ветви стоят на
+        # позиции 0 и делят её контекст. Прежняя редакция брала для B [W, W+1, W+2], то есть
+        # сверяла b0 с предсказанием ПОСЛЕ a(W-1); гейт поймал это как расхождение 2/5.
+        # Бонус тоже был исходным при обеих ветвях -- при ветви A он предсказан в контексте
+        # всех 2W строк, а обязан быть предсказанием после a(W-1). Это и портило «всегда A».
+        ряд = torch.arange(W, device=dev, dtype=torch.long).view(1, W)
+        сдв = torch.where(ряд == 0, 0, ряд + torch.where(берём_B, W, 0).view(B, 1))
+        бонус = torch.where(берём_B, smd.bonus_logits_indices, tli[:, W])
+        return SpecDecodeMetadata(
+            draft_token_ids=dti.gather(1, torch.where(
+                ряд == 0, torch.where(берём_B, W, 0).view(B, 1), ряд + torch.where(
+                    берём_B, W, 0).view(B, 1))).reshape(-1).contiguous(),
+            num_draft_tokens=[W] * B,
+            cu_num_draft_tokens=torch.arange(
+                1, B + 1, device=dev, dtype=smd.cu_num_draft_tokens.dtype
+            ) * W,
+            cu_num_sampled_tokens=smd.cu_num_sampled_tokens,
+            target_logits_indices=tli.gather(1, сдв).reshape(-1).contiguous(),
+            bonus_logits_indices=бонус.contiguous(),
+            logits_indices=smd.logits_indices,
+        )
+
+    def _дерево_принять_B(self, берём_B, W, B, smd) -> None:
+        """[ДЕРЕВО, 05.09] Делает принятие ветви B корректным: off-буфер + слот-копия KV.
+
+        Состояния GDN НЕ копируются вовсе: ядро рекуррента уже ветвится (branch_at), а
+        чтение следующего шага направляется сдвигом num_accepted на W (off-буфер, который
+        читает gdn_attn.build). Копируется только K/V полного внимания: строки ветви B
+        писали в слоты физических позиций ctx+W+1+j, а контекст следующего шага собирается
+        из слотов ctx+1+j.
+        """
+        import sys as _s8
+        try:
+            буф = getattr(self, "_дерево_off", None)
+            if буф is None:
+                from vllm.model_executor.models import qwen3_next as _qn
+                буф = _qn.ДЕРЕВО_OFF.get("буф")      # создан билдером ДО захвата графов
+                if буф is None:
+                    буф = torch.zeros(self.max_num_reqs, dtype=torch.int32,
+                                      device=берём_B.device)
+                    _qn.ДЕРЕВО_OFF["буф"] = буф
+                self._дерево_off = буф
+            _реж = getattr(self, "_дер_реж", 1) if _ДЕРЕВО_ФАЙЛ else 1
+            буф.zero_()
+            if _ДЕРЕВО_OFF_ВКЛ and not (_реж & 8):
+                буф[:B] = берём_B.to(torch.int32) * W
+            self._дерево_зов = getattr(self, "_дерево_зов", 0) + 1
+            _дн = self._дерево_зов <= 8
+            if not _ДЕРЕВО_КВ_КОПИЯ:
+                return
+            _без_кв = bool(_реж & 4)      # запрет копии KV -- рычаг бисекции
+            _без_окна = bool(_реж & 2)    # запрет подмены conv-окна
+            слотыг = getattr(self, "_дерево_слотыг", None)
+            if not слотыг:
+                if _дн: print("[ДЕРЕВО ?] слотыг пуст", file=_s8.stderr, flush=True)
+                return
+            # ГРУППЫ -- ПО ТИПУ СПЕКА, НЕ ПО НОМЕРУ. Прибор показал: группа 0 здесь --
+            # linear_attn (GDN, 48 слоёв), а полное внимание -- другая группа. Номер один
+            # раз находится по имени класса спека и запоминается.
+            _гид_attn = getattr(self, "_дерево_гид_attn", None)
+            if _гид_attn is None:
+                _гид_attn = -1
+                for _g, _гр in enumerate(self.kv_cache_config.kv_cache_groups):
+                    if "FullAttention" in type(_гр.kv_cache_spec).__name__:
+                        _гид_attn = _g
+                        break
+                self._дерево_гид_attn = _гид_attn
+                self._дерево_гиды_гдн = [
+                    _g for _g, _гр in enumerate(self.kv_cache_config.kv_cache_groups)
+                    if "Mamba" in type(_гр.kv_cache_spec).__name__]
+                print(f"[ДЕРЕВО KV] группы: полное внимание={_гид_attn} "
+                      f"GDN={self._дерево_гиды_гдн}", file=_s8.stderr, flush=True)
+            if _гид_attn < 0:
+                return
+            sm = слотыг.get(_гид_attn)
+            if sm is None:
+                if _дн: print(f"[ДЕРЕВО ?] нет группы {_гид_attn}, ключи={list(слотыг)[:5]}",
+                              file=_s8.stderr, flush=True)
+                return
+            q = 2 * W + 1
+            if sm.shape[0] < B * q:
+                if _дн: print(f"[ДЕРЕВО ?] sm короток: {tuple(sm.shape)} < {B}x{q}",
+                              file=_s8.stderr, flush=True)
+                return
+            if _дн:
+                try:
+                    from vllm.model_executor.models.qwen3_next import ДЕРЕВО_OFF as _ДО9
+                    _дг9 = _ДО9.get("дозор") or {}
+                    _нп = (f" nacc(об/ssm)={int(_дг9['nacc'][0])}/{int(_дг9['nacc'][1])}"
+                           if "nacc" in _дг9 else "")
+                except Exception:
+                    _нп = ""
+                print(f"[ДЕРЕВО ?] зов#{self._дерево_зов}: B={B} W={W} "
+                      f"беру={int(берём_B.sum())}{_нп}", file=_s8.stderr, flush=True)
+            # ДОШЁЛ ЛИ OFF-СДВИГ ДО ЯДРА: печатаем пару (nacc, nacc_ssm) на ШАГЕ
+            # ПОСЛЕ принятия ветви B -- именно там сдвиг обязан дать m-1+W. Дозор
+            # заполняется ВНУТРИ графа, поэтому это показание самого ядра, а не
+            # намерения строителя.
+            смв = sm[: B * q].view(B, q)
+            src = смв[:, W + 1: 2 * W + 1][берём_B]      # слоты строк ветви B
+            dst = смв[:, 1: W + 1][берём_B]              # слоты строк ветви A
+            if src.numel() == 0:
+                return
+            src = src.reshape(-1); dst = dst.reshape(-1)
+            кэши = getattr(self, "_дерево_кэши", None)
+            if кэши is None:
+                кэши = []
+                try:
+                    гр0 = self.kv_cache_config.kv_cache_groups[_гид_attn]
+                    ктх = self.compilation_config.static_forward_context
+                    for имя in гр0.layer_names:
+                        сл = ктх.get(имя)
+                        кв = getattr(сл, "kv_cache", None)
+                        if кв is not None and len(кв) > 0 and torch.is_tensor(кв[0]):
+                            кэши.append(кв[0])
+                    print(f"[ДЕРЕВО KV] сборка: слоёв гр0={len(гр0.layer_names)} "
+                          f"собрано={len(кэши)} пример={гр0.layer_names[:1]} "
+                          f"тип_кв={type(getattr(ктх.get(гр0.layer_names[0]), 'kv_cache', None))}",
+                          file=_s8.stderr, flush=True)
+                except Exception as _e:
+                    print(f"[ДЕРЕВО KV] кэши не собраны: {_e}", file=_s8.stderr, flush=True)
+                self._дерево_кэши = кэши
+            if not кэши:
+                return
+            if not _без_кв:
+                for кв in кэши:
+                    bs = кв.shape[2]
+                    кв[dst // bs, :, dst % bs] = кв[src // bs, :, src % bs]
+            self._дерево_событий = getattr(self, "_дерево_событий", 0) + 1
+            if self._дерево_событий <= 5:
+                print(f"[ДЕРЕВО ПРИНЯТИЕ] #{self._дерево_событий}: строкB={int(берём_B.sum())} "
+                      f"kv_слоёв={len(кэши)} src={src[:4].tolist()} dst={dst[:4].tolist()}",
+                      file=_s8.stderr, flush=True)
+            # --- СВЁРТОЧНОЕ ОКНО GDN: подмена из ЧЕРНОВОГО слота -----------------------
+            # Свёртка ветви B посчитана ВТОРЫМ вызовом в черновой слот (qwen3_next,
+            # ДЕРЕВО_OFF["черн"]): его окно -- ровно окно принятой цепи [.., якорь, b0, b1].
+            # При берём_B оно копируется в основной слот, и следующий шаг живёт обычной
+            # цепной арифметикой nacc=m (интеграционный тест test_derevo_conv.py:
+            # relL2 ~6e-08 на ветвях A/B, m=1..3). Прежняя копия якоря в столбец +W --
+            # ОТМЕНЕНА тем же тестом: ряд не выражается точечной правкой.
+            try:
+                from vllm.model_executor.models.qwen3_next import ДЕРЕВО_OFF as _ДО2
+                _реестр = _ДО2.get("черн") or {}
+                # СЛОТЫ -- ПО ГРУППАМ: у каждой KV-группы GDN своя таблица, и слот того же
+                # запроса в другой группе другой. Слои сопоставляются группе по имени.
+                _ктоB = берём_B.nonzero(as_tuple=True)[0]
+                if (_ДЕРЕВО_CONV_SWAP and not _без_окна
+                        and _ктоB.numel() and _реестр):
+                    for гид in getattr(self, "_дерево_гиды_гдн", []):
+                        гр = self.attn_groups[гид][0]
+                        стр = гр.metadata_builders[0] if гр.metadata_builders else None
+                        таб = getattr(стр, "spec_state_indices_tensor", None)
+                        if таб is None or таб.shape[0] < B:
+                            continue
+                        _слоты0 = таб[:B, 0].to(torch.long)[берём_B]
+                        for имя in гр.layer_names:
+                            з2 = _реестр.get(имя)
+                            if з2 is None:
+                                continue
+                            _черн, _осн = з2
+                            # СВОП ОКНА ЗАМЕНЁН ТОЧЕЧНОЙ КОПИЕЙ. Полная подмена окна из
+                            # чернового слота, будучи верной по содержимому (дозор это
+                            # показал), в бою ДОБАВЛЯЛА порчу (136 «!» против 8 без неё) --
+                            # взаимодействие 5- и 7-элементной семантик окна между шагами.
+                            # Здесь ряд чинится в САМОМ основном окне: столбцы строк ветви B
+                            # (sl-T+W+1+j) копируются на места строк ветви A (sl-T+1+j) --
+                            # тогда ряды свёртки следующего шага при обычном nacc=m верны
+                            # для всех m (арифметика та же, что в test_derevo_conv.py).
+                            # ЗОНДЫ ПРИЧИНЫ (бит4 -- запись САМОГО СЕБЯ, бит5 --
+                            # только читаемые позиции 2..W+2). Ядро читает историю
+                            # окно[m-1:m+2] при m<=W+1, то есть дальше индекса W+2
+                            # не заглядывает НИКОГДА (замер sem_read.py). Если
+                            # тождественная запись тоже портит -- виновата САМА
+                            # запись, а не содержимое.
+                            _осн[_слоты0] = _черн[_ктоB]
+                            self._дерево_конв_ок = getattr(self, "_дерево_конв_ок", 0) + 1
+                if getattr(self, "_дерево_событий", 0) <= 5 and _ктоB.numel():
+                    print(f"[ДЕРЕВО conv] окон переложено (слоёв всего): "
+                          f"{getattr(self, '_дерево_конв_ок', 0)}",
+                          file=_s8.stderr, flush=True)
+            except Exception as _e:
+                self._дерево_ошибка_конв = getattr(self, "_дерево_ошибка_конв", 0) + 1
+                if self._дерево_ошибка_конв <= 3:
+                    print(f"[ДЕРЕВО conv] отказ: {type(_e).__name__}: {_e}",
+                          file=_s8.stderr, flush=True)
+        except Exception as _e:
+            self._дерево_ошибка = getattr(self, "_дерево_ошибка", 0) + 1
+            if self._дерево_ошибка <= 3:
+                print(f"[ДЕРЕВО KV] отказ: {type(_e).__name__}: {_e}",
+                      file=_s8.stderr, flush=True)
 
     def _bookkeeping_sync(
         self,
@@ -3040,6 +3784,23 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        # [fa2_sm70] МЕГАЯДРО ВЫШЕ КОМПИЛЯЦИИ. Внутри скомпилированного тела не проходит ничего,
+        # кроме чистых вычислений (проверено шестью отказами: мутации, атрибут функции, логгер).
+        # Здесь -- обычный питон, поэтому и ветвление, и наблюдение разрешены. Метод для этого и
+        # заведён авторами ("we can inspect only this method versus the whole execute_model").
+        import os as _os
+        if _os.environ.get("FA2SM70_MEGA") == "1":
+            try:
+                import fa2_sm70.megastep as _ms
+                # РАННЕР ОТДАЁТСЯ ЯВНО: ярус Я5 (весь шаг одним пуском, включая сэмплер) не может
+                # быть построен, пока видна только модель -- сэмплер и голова живут на раннере.
+                _ms._РАННЕР = self
+                _r = _ms.попробовать_проход(self.model, input_ids, positions,
+                                            intermediate_tensors, inputs_embeds)
+                if _r is not None:
+                    return _r
+            except Exception:
+                raise                    # НЕ глотать: тихий откат скрыл бы неработающую цепь
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -3128,6 +3889,20 @@ class GPUModelRunner(
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, use_cascade_attn or has_encoder_output
         )
+        # [ПРОБА РЕЖИМА ГРАФА, 07.09] Пофазный секундомер показал: прямой проход цели
+        # со спекуляцией 36.3 мс при работе GPU ~19 -- подпись пути БЕЗ полного графа.
+        # Здесь печатается решение диспетчера: какой режим и на сколько токенов.
+        if os.environ.get("FA2SM70_CG_PROBE", "0") == "1":
+            _к = (str(cudagraph_mode), int(batch_descriptor.num_tokens), bool(uniform_decode))
+            _п = getattr(self, "_реж_графа", None)
+            if _п is None:
+                _п = self._реж_графа = {}
+            _п[_к] = _п.get(_к, 0) + 1
+            if sum(_п.values()) in (5, 50) or sum(_п.values()) % 200 == 0:
+                print("[РЕЖИМ ГРАФА] " + "  ".join(
+                    f"{м}/ток={т}/uniform={u}: {n}" for (м, т, u), n in
+                    sorted(_п.items(), key=lambda x: -x[1])[:5]),
+                    file=__import__("sys").stderr, flush=True)
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (
@@ -3310,6 +4085,44 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if _ФАЗА_ШАГА_N:
+            # ПРОМЕЖУТОК МЕЖДУ ШАГАМИ: воркер простаивает, работает движок/планировщик.
+            _т = time.perf_counter()
+            if getattr(self, "_t_конец_шага", None) is not None:
+                self._фаза_шага("МЕЖДУ шагами (движок)", _т - self._t_конец_шага)
+            # ПЕРИОД МЕЖДУ ВХОДАМИ -- однозначная мера: сколько идёт ПОЛНЫЙ цикл шага, включая всё,
+            # что делается вне воркера. Разность «период минус воркер» и есть искомое.
+            if getattr(self, "_t_вход_пред", None) is not None:
+                _пер = _т - self._t_вход_пред
+                self._фаза_шага("ПЕРИОД (вход->вход)", _пер)
+                # МАКСИМУМ И СУММА: среднее занижается, если между настоящими шагами движок делает
+                # короткие холостые заходы. Сумма периодов -- это СТЕНОЧНОЕ время окна, её и надо
+                # сверять с секундомером снаружи.
+                self._пер_макс = max(getattr(self, "_пер_макс", 0.0), _пер)
+                self._пер_сумма = getattr(self, "_пер_сумма", 0.0) + _пер
+                self._пер_счёт = getattr(self, "_пер_счёт", 0) + 1
+            self._t_вход_пред = _т
+            self._t_шаг = _т
+        if _ПОДРЕЗ_МиБ:
+            # [ИСПРАВЛЕНО 10.09 -- МОЯ ЖЕ РЕГРЕССИЯ, НАЙДЕНА ТРАССОЙ СО СТЕКАМИ]
+            # Стояло `max(num_scheduled_tokens.values()) > 1` с пометкой «только префилльный
+            # шаг». При СПЕКУЛЯЦИИ декодный шаг планирует k+1=4 токена на запрос, поэтому
+            # условие было истинно НА КАЖДОМ ШАГЕ. А в комментарии я написал, что проверка
+            # «стоит наносекунды»: тоже неверно -- `torch.cuda.memory_reserved()` идёт через
+            # `memory_stats()`, и трасса показала 322 вызова `_recurse_add_to_result` НА ШАГ.
+            # То есть я сам внёс питон в горячий путь -- ровно то, что запрещает пункт 5 цели.
+            # Лечение: отсекать по ОБЩЕМУ числу токенов шага (целое из планировщика, дешевле
+            # некуда), и только потом трогать распределитель.
+            _всего = getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+            if _всего > _ПОДРЕЗ_ТОКЕНОВ:
+                _дер = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                if _дер > _ПОДРЕЗ_МиБ * 2 ** 20:
+                    torch.cuda.empty_cache()
+                    self._подрез_счёт = getattr(self, "_подрез_счёт", 0) + 1
+                    if self._подрез_счёт <= 3 or self._подрез_счёт % 64 == 0:
+                        logger.info("[fa2_sm70 ПОДРЕЗКА] вернул %.0f МиБ держанных "
+                                    "(всего подрезок %d)", _дер / 2 ** 20,
+                                    self._подрез_счёт)
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3376,10 +4189,14 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            _тп = time.perf_counter()
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("подготовка входа", time.perf_counter() - _тп)
+                self._t_после_подготовки = time.perf_counter()
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3461,6 +4278,7 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            _тс = time.perf_counter()
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -3471,7 +4289,11 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            self._дерево_слотыг = slot_mappings_by_group   # [ДЕРЕВО] для слот-копии KV
 
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("  слоты по слоям", time.perf_counter() - _тс)
+            _тм = time.perf_counter()
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3487,6 +4309,8 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("  метаданные внимания", time.perf_counter() - _тм)
 
             (
                 input_ids,
@@ -3531,13 +4355,24 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            _тф = time.perf_counter()
+            if _ФАЗА_ШАГА_N and getattr(self, "_t_после_подготовки", None):
+                # УЧАСТОК МЕЖДУ подготовкой входа и проходом: метаданные внимания, слоты по слоям,
+                # контекст прохода. Именно сюда указала разность зондов (12 мс со спекуляцией).
+                self._фаза_шага("метаданные+слоты до прохода",
+                                _тф - self._t_после_подготовки)
+            with self._фаза_карты("проход цели"):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            if _ФАЗА_ШАГА_N:
+                if not _ФАЗА_БЕЗ_СИНХР:
+                    torch.cuda.synchronize()
+                self._фаза_шага("прямой проход цели", time.perf_counter() - _тф)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3566,8 +4401,12 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                _тл = time.perf_counter()
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                if _ФАЗА_ШАГА_N:
+                    torch.cuda.synchronize()
+                    self._фаза_шага("словарь (logits)", time.perf_counter() - _тл)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3611,6 +4450,8 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        if _ФАЗА_ШАГА_N and getattr(self, "_t_шаг", None):
+            self._фаза_шага("execute_model целиком", time.perf_counter() - self._t_шаг)
         return None
 
     @torch.inference_mode
@@ -3659,8 +4500,99 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            _тв = time.perf_counter()
+            # [ОКНО НА КАРТУ ДЛЯ ВЫБОРКИ -- 10.09, записка 25 §279]
+            # Фаза «выборка+отбраковка» (2.14 мс) считалась ПРОСТОЕМ карты, но внутри отбраковки
+            # стоит `output_token_ids.cpu()` -- значит часть этого времени это ОЖИДАНИЕ ядер
+            # выборки, то есть работа карты. Без этого окна работа по порядку шага делалась бы
+            # по завышенной щели.
+            with self._фаза_карты("выборка на карте"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+            if _ФАЗА_ШАГА_N:
+                torch.cuda.synchronize()
+                self._фаза_шага("выборка+отбраковка", time.perf_counter() - _тв)
 
+        # [ПРОБА ПОКРЫТИЯ ЧЕРНОВИКА, ЕДИНИЦА СРАВНЕНИЯ СОВПАДАЕТ] Кандидаты позиции 0, которые
+        # черновик предложил ДЛЯ ЭТОГО ЖЕ шага, против токена, который цель на этой позиции реально
+        # выдала (`sampled_token_ids[:, 0]` -- либо принятый черновиковый, либо замена). Отвечает на
+        # вопрос, от которого зависит, окупится ли ДЕРЕВО: черновик промахивается мимо цели или
+        # только плохо её ранжирует.
+        _пк = int(os.environ.get("FA2SM70_DFLASH2_COVER", "0"))
+        if _пк and getattr(self, "drafter", None) is not None:
+            _к0 = getattr(self.drafter, "канд0", None)
+            if _к0 is not None and sampler_output.sampled_token_ids is not None:
+                _ф = sampler_output.sampled_token_ids[: _к0.shape[0], 0:1]
+                _сум = getattr(self, "_покр_сум", None)
+                if _сум is None:
+                    _сум = self._покр_сум = {}
+                    self._покр_н = 0
+                for _n in (1, 2, 4, 8, 16):
+                    _сум[_n] = _сум.get(_n, 0) + int((_к0[:, :_n] == _ф).any(dim=1).sum())
+                self._покр_н += int(_к0.shape[0])
+                # УСЛОВИЕ ПЕЧАТИ БЫЛО ТОЧНЫМ КРАТНЫМ, а счётчик растёт на РАЗМЕР
+                # БАТЧА -- кратное почти никогда не совпадало, и годная проба молчала,
+                # пока в журнале печаталась СОСЕДНЯЯ, испорченная (та давала top-1=7 %
+                # при истинной приёмке позиции 0 равной 56 %). Печатаем по порогу.
+                if self._покр_н - getattr(self, "_покр_печ", 0) >= _пк:
+                    self._покр_печ = self._покр_н
+                    logger.info("[fa2_sm70 ПОКРЫТИЕ0, %d шагов] %s", self._покр_н,
+                                "  ".join(f"top-{_n}={_сум.get(_n,0)/self._покр_н*100:.1f}%"
+                                          for _n in (1, 2, 4, 8, 16)))
+                self.drafter.канд0 = None
+        if _ВЫБОРКА_ФАЙЛ and getattr(self, "drafter", None) is not None:
+            _с0 = getattr(self.drafter, "скрыт0", None)
+            _у0 = getattr(self.drafter, "унар0", None)
+            _кд = getattr(self.drafter, "_канд_для_выборки", None)
+            if (_с0 is not None and _у0 is not None and _кд is not None
+                    and sampler_output.sampled_token_ids is not None):
+                _б = getattr(self, "_выб_буфер", None)
+                if _б is None:
+                    _б = self._выб_буфер = []
+                    self._выб_всего = 0
+                _n = min(_с0.shape[0], sampler_output.sampled_token_ids.shape[0])
+                if _n > 0 and self._выб_всего < _ВЫБОРКА_ПРЕДЕЛ:
+                    _ц0 = getattr(self.drafter, "цель0", None)
+                    _б.append((
+                        _с0[:_n].to(torch.float16).cpu(),
+                        _кд[:_n].to(torch.int32).cpu(),
+                        _у0[:_n].to(torch.float16).cpu(),
+                        sampler_output.sampled_token_ids[:_n, 0].to(torch.int32).cpu(),
+                        None if _ц0 is None else _ц0[:_n].cpu(),
+                    ))
+                    self._выб_всего += _n
+                    if len(_б) >= 200 or self._выб_всего >= _ВЫБОРКА_ПРЕДЕЛ:
+                        import os as _o
+                        # КУСКАМИ, А НЕ ПЕРЕЗАПИСЬЮ ЦЕЛИКОМ: перезапись растёт
+                        # квадратично и на 40 тыс. строк съела бы сбор целиком.
+                        _к = getattr(self, "_выб_кусок", 0)
+                        self._выб_кусок = _к + 1
+                        _путь = f"{_ВЫБОРКА_ФАЙЛ}.{_o.getpid()}.{_к:04d}.pt"
+                        torch.save(_б, _путь)
+                        _б.clear()
+                        print(f"[ВЫБОРКА] сохранено {self._выб_всего} строк -> {_путь}",
+                              file=__import__("sys").stderr, flush=True)
+            self.drafter.скрыт0 = None
+            self.drafter.унар0 = None
+            self.drafter.цель0 = None
+
+        if _ВОЗВРАТ_ПАМЯТИ and not getattr(self, "_мем_возвращено", False):
+            self._мем_возвращено = True
+            _до_св, _вс = torch.cuda.mem_get_info()
+            torch.cuda.empty_cache()
+            _по_св, _ = torch.cuda.mem_get_info()
+            logger.info("[fa2_sm70 ПАМЯТЬ] возвращено драйверу %.2f ГиБ "
+                        "(свободно %.2f -> %.2f из %.2f)",
+                        (_по_св - _до_св) / 2**30, _до_св / 2**30, _по_св / 2**30, _вс / 2**30)
+        if _ОПИСЬ_ПАМЯТИ and getattr(self, "_мем_печ", 0) < _ОПИСЬ_ПАМЯТИ:
+            self._мем_печ = getattr(self, "_мем_печ", 0) + 1
+            _св, _всего = torch.cuda.mem_get_info()
+            logger.info(
+                "[fa2_sm70 ПАМЯТЬ] занято торчем %.2f ГиБ, ДЕРЖИТ (reserved) %.2f, "
+                "не отдано драйверу %.2f | свободно у драйвера %.2f из %.2f",
+                torch.cuda.memory_allocated() / 2**30,
+                torch.cuda.memory_reserved() / 2**30,
+                (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / 2**30,
+                _св / 2**30, _всего / 2**30)
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -3678,9 +4610,27 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
+        # [ПРИБОР СЛОЁВ, 29.08] Снимок буферов, заполненных ВНУТРИ графа, читается ЗДЕСЬ --
+        # после шага и вне графа. Иначе локализовать расхождение нечем: питон при повторе
+        # графа не исполняется, хуки и печать из слоя молчат.
+        if _ДБГ_СЛОИ_ВКЛ:
+            try:
+                from vllm.model_executor.models.qwen3_next import дбг_снимок
+                _ш = getattr(self, "_дбг_шаг", 0) + 1
+                self._дбг_шаг = _ш
+                if _ш <= int(_os.environ.get("FA2SM70_DBG_STEPS", "3")):
+                    import sys as _sdbg
+                    for _i, _в in дбг_снимок().items():
+                        print(f"[СЛОЙ шаг={_ш} слой={_i:02d}] "
+                              + " ".join(f"{x:+.6f}" for x in _в[:4]),
+                              file=_sdbg, flush=True)
+            except Exception:
+                pass
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                _тч = time.perf_counter()
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -3692,6 +4642,9 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                if _ФАЗА_ШАГА_N:
+                    torch.cuda.synchronize()
+                    self._фаза_шага("черновик", time.perf_counter() - _тч)
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -3707,7 +4660,7 @@ class GPUModelRunner(
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlash2Proposer)
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -3735,6 +4688,7 @@ class GPUModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            _тб = time.perf_counter()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -3751,6 +4705,8 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("учёт (bookkeeping)", time.perf_counter() - _тб)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -3783,6 +4739,9 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            if _ФАЗА_ШАГА_N and getattr(self, "_t_шаг", None):
+                self._t_конец_шага = time.perf_counter()
+                self._фаза_шага("воркер целиком", self._t_конец_шага - self._t_шаг)
             return output
 
         with record_function_or_nullcontext(
@@ -3795,6 +4754,14 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                гран_ctx=(
+                    self.input_batch.num_computed_tokens_cpu[
+                        : self.input_batch.num_reqs
+                    ].tolist()
+                    if (_ГРАН_БОНУС and self.num_spec_tokens)
+                    else None
+                ),
+                гран_B=int(getattr(self.cache_config, "block_size", 0) or 0),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -3806,6 +4773,9 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        if _ФАЗА_ШАГА_N and getattr(self, "_t_шаг", None):
+            self._t_конец_шага = time.perf_counter()
+            self._фаза_шага("воркер целиком", self._t_конец_шага - self._t_шаг)
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -3858,11 +4828,19 @@ class GPUModelRunner(
     ) -> None:
         # Check if we need to copy draft tokens to CPU. In async scheduling,
         # we only copy when needed for structured output, penalties or bad_words.
+        # [ГРАНИЦА БЛОКА СОСТОЯНИЯ -- ИСКЛЮЧЕНИЕ ИЗ РАННЕГО ВЫХОДА, 01.09]
+        # При async черновик НЕ сходит на процессор, и потому пропуск спекуляции у границы
+        # (`_гран_пропуск`) был мёртв: функция ниже не звалась НИ РАЗУ (поймано счётчиком).
+        # Это и есть причина, по которой обрыв на границе не ушёл на сборке 31.08
+        # (reports/vllm-granica-ne-ushla-2026-08-31.md: 5 событий на 23 генерациях, две точные
+        # подписи 4095 и 4097). Копируем ВОПРЕКИ раннему выходу, но только когда хотя бы один
+        # запрос стоит вплотную к границе -- это 5 шагов из 4096, то есть 0.12 % шагов.
         if self.use_async_scheduling and not (
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids
         ):
-            return
+            if not (_ГРАН_ПРОПУСК and self._гран_рядом()):
+                return
         # We must also set the corresponding request ids.
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
@@ -3886,16 +4864,196 @@ class GPUModelRunner(
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    def _гран_слот_проверить(self, req_indices, positions_np, num_reqs) -> None:
+        """Инвариант границы: блок под каждую позицию шага обязан быть уже в таблице.
+
+        `compute_slot_mapping` адресует block_table[req, pos // block_size] БЕЗ проверки
+        ширины: если планировщик не выделил блок под последнюю позицию шага, читается
+        нулевая ячейка, и KV этой позиции уезжает в блок 0 -- чужой контекст. Прибор ищет
+        ровно это, по всем KV-группам (у гибрида их десять, размеры блока разные).
+        """
+        import sys as _s4
+        for гр, таб in enumerate(self.input_batch.block_table.block_tables):
+            B = int(таб.block_size)
+            шир = таб.num_blocks_per_row
+            for i in range(num_reqs):
+                маска = req_indices == i
+                if not маска.any():
+                    continue
+                макс = int(positions_np[маска].max())
+                надо = макс // B + 1
+                есть = int(шир[i])
+                if надо > есть:
+                    print(f"[ГРАН-СЛОТ] группа={гр} строка={i} макс_поз={макс} B={B} "
+                          f"надо блоков={надо} есть={есть} -> KV уедет в блок 0",
+                          file=_s4.stderr, flush=True)
+                elif макс % B < 4 or (B - 1 - макс % B) < 4:
+                    print(f"[ГРАН-СЛОТ] у границы: группа={гр} строка={i} макс_поз={макс} "
+                          f"B={B} блоков={есть} q={int(маска.sum())}",
+                          file=_s4.stderr, flush=True)
+
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
-            return self._draft_token_ids, self.input_batch.req_ids
+            return self._гран_пропуск(self._draft_token_ids, self.input_batch.req_ids), self.input_batch.req_ids
         req_ids = self._draft_token_req_ids
         if req_ids is None:
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        _спис = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        return self._гран_пропуск(_спис, req_ids), req_ids
+
+    def _гран_рядом(self) -> bool:
+        """Стоит ли хоть один запрос вплотную к границе блока состояния.
+
+        Считается ТОЛЬКО по процессорным копиям (`num_computed_tokens_cpu`) -- ни одного
+        обращения к карте, поэтому проверка не рвёт асинхронность: она стоит несколько
+        десятков наносекунд и истинна на 5 шагах из 4096.
+        """
+        if not self.num_spec_tokens:
+            return False
+        try:
+            B = self._гран_блок
+        except AttributeError:
+            B = getattr(self.cache_config, "mamba_block_size", None) or 0
+            if not B:
+                try:
+                    for _g in (self.kv_cache_config.kv_cache_groups or ()):
+                        if type(_g.kv_cache_spec).__name__ == "MambaSpec":
+                            B = int(_g.kv_cache_spec.block_size); break
+                except Exception:
+                    B = 0
+                if not B:
+                    B = int(getattr(self.cache_config, "block_size", 0) or 0)
+            self._гран_блок = B
+        if not B:
+            return False
+        n = self.input_batch.num_reqs
+        нкт = self.input_batch.num_computed_tokens_cpu
+        k = self.num_spec_tokens
+        for i in range(n):
+            ctx = int(нкт[i])
+            # ОКНО ОСТАВЛЕНО УЗКИМ. Расширение (+-k) и второй источник длины проверены
+            # статистически 03.09: обрывов 9 из 20 и с ними, и БЕЗ механизма вовсе -- то есть
+            # снятие спекуляции у границы этот дефект не лечит, а лишняя ширина только чаще
+            # выключает спекуляцию. Гипотеза §58-59 для обрыва 8192 ОПРОВЕРГНУТА замером.
+            if ctx > 0 and (ctx - 1) // B != (ctx + k + 1) // B:
+                return True
+        return False
+
+
+
+    def _гран_пропуск(self, спис, req_ids):
+        """ПУТЬ 3 ЛЕЧЕНИЯ ГРАНИЦЫ БЛОКА СОСТОЯНИЯ (записка 25 §58-59).
+
+        На шаге, где k+1 черновых токенов переходят границу блока состояния GDN, align-таблица
+        спекуляции начинается уже с НОВОГО блока, а состояние лежит в старом -- блока со
+        состоянием в её колонках нет вовсе. Замерено прибором:
+            seq_len=4097..4100 ctx=4093..4096 start_po_seq=1 start_po_ctx=0
+        Прямое лечение (дать спекуляции опору по посчитанным) ОПРОВЕРГНУТО: генерация
+        вырождается в нули. Поэтому такой шаг просто идёт БЕЗ спекуляции: пустой черновик
+        делает строку не-спекулятивной, а не-спек путь границу проходит верно (read по
+        посчитанным, write по запланированным).
+
+        Цена -- один шаг из block_size, то есть 0.02 %.
+        """
+        if _ГРАН_ЛОГ:
+            self._гран_зовов = getattr(self, "_гран_зовов", 0) + 1
+            if self._гран_зовов % 500 == 1:
+                import sys as _s6
+                print(f"[УРЕЗАНИЕ] вызовов пропуска: {self._гран_зовов} "
+                      f"(строк {len(спис) if спис else 0})", file=_s6.stderr, flush=True)
+        if not _ГРАН_ПРОПУСК or not спис:
+            return спис
+        try:
+            B = self._гран_блок
+        except AttributeError:
+            B = getattr(self.cache_config, "mamba_block_size", None) or 0
+            if not B:
+                # mamba_block_size может быть не заполнен; берём размер блока у СПЕЦИФИКАЦИИ
+                # групп состояния, а последним доводом -- блок внимания (движок подгоняет его
+                # под страницу mamba: см. «Setting attention block size to 4096 tokens»).
+                try:
+                    for _g in (self.kv_cache_config.kv_cache_groups or ()):
+                        _sp = _g.kv_cache_spec
+                        if type(_sp).__name__ == "MambaSpec":
+                            B = int(_sp.block_size); break
+                except Exception:
+                    B = 0
+                if not B:
+                    B = int(getattr(self.cache_config, "block_size", 0) or 0)
+            self._гран_блок = B
+        if not B:
+            return спис
+        нкт = self.input_batch.num_computed_tokens_cpu
+        for i, стр in enumerate(спис):
+            if not стр:
+                continue
+            ctx = int(нкт[i])
+            # [УЛЬТРАКОРОТКИЙ КОНТЕКСТ -- ВТОРАЯ НАХОДКА ОТЧЁТА 31.08]
+            # Отчёт (раздел 5) фиксирует РОСТ невоспроизводимости однотокенных запросов:
+            # 'раз' давал 3 из 40 различных ответов 29.08 и 14 из 40 31.08. Замер 01.09 назвал
+            # виновника снятием фазы: БЕЗ спекуляции 'раз' даёт 1 вариант из 40 и НОЛЬ пустых,
+            # с ней -- 3 варианта и 8 ПУСТЫХ ответов. То есть на вырожденном контексте черновик
+            # предлагает конец последовательности, и приёмка его берёт.
+            # Лечение то же, что у границы: на таком шаге спекуляции просто нет.
+            if 0 < ctx < _МИН_КОНТЕКСТ:
+                спис[i] = []
+                self._гран_коротко = getattr(self, "_гран_коротко", 0) + 1
+                continue
+            if ctx <= 0:
+                # Начало последовательности: (0-1)//B = -1, и наивное сравнение давало ложное
+                # срабатывание на первом же шаге. Поймано печатью позиций: ctx=0 в списке снятий.
+                continue
+            # Окно с запасом: на момент вызова число посчитанных ещё не учло принятые этого
+            # шага, поэтому граница проверяется не точкой, а отрезком ctx-1 .. ctx+k+1.
+            # Замер (промпт 3889, k=3, B=4096) дал снятия ровно на ctx=4092..4096 -- пять шагов
+            # у границы и ни одного лишнего.
+            # [04.09 ЗАПАС НА АСИНХРОННОСТЬ] Черновик готовится для СЛЕДУЮЩЕГО шага, а `ctx`
+            # здесь -- от текущего: при асинхронном планировании они расходятся ровно на число
+            # принятых (до k+1). Прибор [СДВИГ ОПОРЫ] ловил шаги ctx=8190 q=4, то есть урезание
+            # считало место по контексту, который к исполнению уже ушёл за границу. Поэтому
+            # зона снятия берётся с запасом на этот разбег: 2(k+1) позиций, то есть ~8 шагов
+            # из 4096 (0.2 %), и внутри неё черновик снимается ЦЕЛИКОМ, а не урезается.
+            _запас = 2 * (len(стр) + 1)
+            if _ГРАН_ВСЕГДА or (ctx - 1) // B != (ctx + _запас) // B:
+                спис[i] = []
+                self._гран_снято = getattr(self, "_гран_снято", 0) + 1
+                if _ГРАН_ЛОГ:
+                    import sys as _s7
+                    print(f"[СНЯТИЕ] ctx={ctx} было={len(стр)} запас={_запас} B={B} "
+                          f"всего={self._гран_снято}", file=_s7.stderr, flush=True)
+                continue
+            if (ctx - 1) // B != (ctx + len(стр) + 1) // B:
+                # [УРЕЗАНИЕ ВМЕСТО СНЯТИЯ -- 03.09]
+                # Полное снятие черновика у границы дефект НЕ лечит: 9 обрывов из 20 и с ним,
+                # и без него (записка 25 §121). Зато замер по глубине спекуляции показал прямую
+                # зависимость: k=1 -> 5 % обрывов, k=3 -> 45 %. Значит вредит не спекуляция как
+                # таковая, а ЧИСЛО позиций, пересекающих границу. Оставляем ровно столько
+                # черновых токенов, сколько влезает ДО границы: строка остаётся спекулятивной
+                # (однородность батча не рвётся), но границу за шаг не переходит.
+                # [04.09 ФОРМУЛА СЧИТАЛА ОТ ctx, А ОПОРА СТОИТ НА ctx-1]
+                # Опора spec-таблицы -- блок ПОСЛЕДНЕЙ позиции шага, а состояние прошлого
+                # шага лежит в блоке позиции ctx-1. Значит все позиции шага обязаны лежать в
+                # блоке (ctx-1)//B. Прежняя формула считала место до конца блока, где лежит
+                # САМ ctx, и при ctx, кратном блоку, давала 4095 -- то есть не урезала ничего
+                # ровно на том шаге, где опора и уезжает (прибор: ctx=8192 было=3 стало=4095,
+                # следом [СДВИГ ОПОРЫ] start_тек=2 start_зап=1).
+                _влезает = max(0, ((ctx - 1) // B + 1) * B - ctx - 1)
+                спис[i] = стр[:_влезает] if _влезает else []
+                self._гран_снято = getattr(self, "_гран_снято", 0) + 1
+                if _ГРАН_ЛОГ:
+                    import sys as _s5
+                    print(f"[УРЕЗАНИЕ] ctx={ctx} было={len(стр)} стало={_влезает} "
+                          f"B={B} всего={self._гран_снято}", file=_s5.stderr, flush=True)
+                if _ГРАН_ЛОГ:
+                    # Печать РЕДКАЯ по построению: событие бывает 5 раз на block_size шагов
+                    # (0.12 %), поэтому журнал она не засоряет, а доказательство даёт.
+                    import sys as _s
+                    print(f"[ГРАНИЦА] спекуляция снята: ctx={ctx} k={len(стр)} B={B} "
+                          f"всего={self._гран_снято}", file=_s.stderr, flush=True)
+        return спис
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -3943,6 +5101,42 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        # [ЖИВОЙ РЯД ДЛЯ n-ГРАММ 31.08] Отдаём предлагателю ПРИНЯТЫЕ токены шага. Это
+        # единственный источник, который их содержит: `token_ids_cpu` движок пишет только при
+        # добавлении запроса, а `req_output_token_ids` держит заполнители -1, пока реальные
+        # значения не потребуются штрафам. Без этого поиск n-грамм шёл по ОДНОМУ ПРОМПТУ и
+        # не срабатывал ни разу за прогон (замер: `нет совпадения=149 из 149`, длина
+        # совпадения ровно 1 на каждом шаге).
+        self._fa2_принятые = sampled_token_ids
+        if _ДЕРЕВО_ТАУ and sampled_token_ids is not None:
+            # [ЗАМЕР TAU ЧЕРЕДОВАНИЕМ ВНУТРИ ОДНОГО ПРОЦЕССА]
+            # Скорость на этой машине мерить нельзя: соседний боевой даёт монотонный дрейф
+            # (одна и та же база дала 26.53 -> 38.04 мс/ток подряд, записка 25 §65). Но tau --
+            # это КАЧЕСТВО черновика, и от фона она не зависит. Режим переключается ФАЙЛОМ,
+            # без перезапуска, поэтому оба плеча меряются в одном временном окне.
+            # Принятые приходят СПИСКОМ строк (n-граммы) либо ТЕНЗОРОМ [B, k+1] с
+            # заполнителем -1 у отвергнутых. Первая редакция знала только про список, и
+            # замер молчал весь прогон -- признак тот же, что и всегда: НИ ОДНОЙ строки.
+            if isinstance(sampled_token_ids, list):
+                if not sampled_token_ids:
+                    return
+                _пр = sum(len(r) for r in sampled_token_ids) / len(sampled_token_ids)
+            else:
+                _т = sampled_token_ids
+                _пр = float((_т >= 0).sum().item()) / max(_т.shape[0], 1)
+            _реж = getattr(self, "_дер_реж", 0)
+            self._тау_сум = getattr(self, "_тау_сум", {0: 0.0, 1: 0.0})
+            self._тау_н = getattr(self, "_тау_н", {0: 0, 1: 0})
+            self._тау_сум[_реж] += _пр
+            self._тау_н[_реж] += 1
+            if (self._тау_н[0] + self._тау_н[1]) % _ДЕРЕВО_ТАУ == 0:
+                import sys as _s
+                _a = self._тау_сум[0] / max(self._тау_н[0], 1)
+                _b = self._тау_сум[1] / max(self._тау_н[1], 1)
+                print(f"[TAU] tolko_A={_a:.3f} ({self._тау_н[0]} shagov)  "
+                      f"derevo={_b:.3f} ({self._тау_н[1]} shagov)  "
+                      f"priz={(_b / _a - 1) * 100 if _a > 0 else 0:+.1f}%",
+                      file=_s.stderr, flush=True)
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -3987,7 +5181,7 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlash2Proposer)
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4038,6 +5232,8 @@ class GPUModelRunner(
                     )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
+                if _ДАМП_MTP and num_scheduled_tokens >= _ДАМП_MTP_МИН:
+                    self._снять_для_головы(target_hidden_states, target_token_ids)
             else:
                 if spec_config.disable_padded_drafter_batch:
                     token_indices_to_sample = None
@@ -4085,18 +5281,29 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                last_token_indices=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
+            # [ПРОХОД ЧЕРНОВИКА: КАРТА ОТДЕЛЬНО ОТ ХОЗЯИНА -- 09.09, записка 25 §249]
+            # §236 намерил «проход черновика 10.52 мс» ХОЗЯЙСКИМ таймером, то есть время
+            # ВЫДАЧИ ядер. Пол чтения весов у трёх проходов головы ~5.4 мс, и вопрос, на
+            # который нельзя ответить хозяйским таймером: остальные ~5 мс -- это работа
+            # карты или ЩЕЛИ между запусками (черновик у vLLM принципиально PIECEWISE,
+            # eagle.py:289). Ответ решает, стоит ли полный граф черновика.
+            _тчер = time.perf_counter() if _ФАЗА_ШАГА_N else 0.0
+            with self._фаза_карты("проход черновика"):
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    last_token_indices=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
+            if _ФАЗА_ШАГА_N:
+                self._фаза_шага("проход черновика (хозяин)",
+                                time.perf_counter() - _тчер)
 
         return draft_token_ids
 
@@ -4299,13 +5506,36 @@ class GPUModelRunner(
 
         hf_config = self.speculative_config.draft_model_config.hf_config
         if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
+            # [FA2/SM70 25.08] РАНЬШЕ ЗДЕСЬ БЫЛ ГЛУХОЙ ВЫХОД, и он молча уводил на умолчание
+            # eagle3 (ТРИ слоя). У чекпойнта DFlash2 этого поля нет вовсе -- слои названы
+            # `dflash_config.target_layer_ids`. Тихий откат на умолчание -- худший вид отказа:
+            # сеть поднимается, а черновик кормится не тем; ловится только формой (15360 != 25600).
+            return self._dflash_aux_layers()
 
         layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
-        return None
+        return self._dflash_aux_layers()
+
+    def _dflash_aux_layers(self) -> tuple[int, ...] | None:
+        """[FA2/SM70 25.08] Слои-доноры для DFlash/DFlash2 -- ДОПИСАНО, прежнее не тронуто.
+
+        Метод выше знает лишь про `eagle_aux_hidden_state_layer_ids`; у чекпойнта DFlash2 слои
+        названы иначе -- `dflash_config.target_layer_ids` = [5,19,33,47,61], и у них СВОЯ
+        нумерация: движку нужен индекс СЛЕДУЮЩЕГО слоя (+1), потому что признак снимается на
+        входе слоя, а не на выходе. Без этого черновик получал ТРИ признака вместо пяти
+        (умолчание eagle3), и `fc` ждал 25600 против приехавших 15360 -- ровно то, на чём
+        споткнулся первый пуск. Полный разбор нумерации живёт в gpu/spec_decode/eagle3_utils.py,
+        мы его здесь и переиспользуем, а не копируем.
+        """
+        try:
+            from vllm.v1.worker.gpu.spec_decode.eagle3_utils import (
+                get_eagle3_aux_layers_from_config,
+            )
+        except ImportError:
+            return None
+        return get_eagle3_aux_layers_from_config(self.speculative_config)
 
     def reload_weights(
         self,
@@ -4875,7 +6105,7 @@ class GPUModelRunner(
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
             ):
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlash2Proposer)
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
@@ -5174,6 +6404,30 @@ class GPUModelRunner(
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
+
+        # [МИНА ГРАФА, 06.09] ТАБЛИЦЫ МАСШТАБОВ int16 СОЗДАЮТСЯ ЗДЕСЬ, ДО ЗАХВАТА.
+        # Они привязываются лениво к тензору состояния (`fa2sm70_gdn_i16.таблица`), а
+        # первый вызов на НАСТОЯЩЕМ пуле -- это и есть захват графа: тензор, выделенный
+        # во время захвата, живёт в пуле графа, после захвата эта память переиспользуется,
+        # а запечённый указатель продолжает по ней писать. Снаружи -- Xid 13 и смерть
+        # воркера. Бисекция 06.09 (§153) показала: дефекту нужны РОВНО три условия --
+        # спекуляция, полный граф и int16-пул; снятие любого лечит.
+        try:
+            import fa2sm70_gdn_i16 as _i16м
+            if _i16м.включён():
+                _сд = 0
+                for _имя, _сл in self.compilation_config.static_forward_context.items():
+                    _кв = getattr(_сл, "kv_cache", None)
+                    if not _кв:
+                        continue
+                    for _вэ in _кв:
+                        _сост = _вэ[1] if isinstance(_вэ, (list, tuple)) and len(_вэ) > 1 else None
+                        if _сост is not None and getattr(_сост, "dtype", None) == torch.int16:
+                            _i16м.таблица(_сост)
+                            _сд += 1
+                logger.info("[fa2_sm70] таблиц масштабов int16 заведено ДО захвата: %d", _сд)
+        except Exception as _e:
+            logger.warning("[fa2_sm70] масштабы int16 до захвата не заведены: %s", _e)
 
         start_time = time.perf_counter()
 
@@ -5574,7 +6828,7 @@ class GPUModelRunner(
 
         # Initialize eagle's cudagraph dispatcher if using eagle spec decode.
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, EagleProposer | DFlash2Proposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
@@ -6059,7 +7313,7 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlash2Proposer)
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
