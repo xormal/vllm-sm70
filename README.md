@@ -1,5 +1,7 @@
 # vLLM-SM70
 
+**English** · [Русский](README.ru.md)
+
 **The production vLLM stack for NVIDIA Volta (V100, `sm_70`).** It serves Qwen3.8-27B (GPTQ-Int8)
 with a 262,144-token context on two 32 GB cards, plus Cloudflare's Clef decision model on the same
 weights.
