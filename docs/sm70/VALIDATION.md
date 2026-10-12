@@ -35,6 +35,7 @@ configuration (MTP k=3, fp16 all-reduce).
 | Mixed load (10 Clef + 6 chats) × 3 rounds | 16/16 each round; Clef vs single runs max \|Δp\| 0.0185, 34/35 (same near-tie) |
 | Heavy order: images ×2 → 243K needle → images, Clef inside every storm | images 8/8 ×3, Clef 2/2 ×3, needle found, ≥ 912 MiB free at peak (stand), 782 MiB (production) |
 | Clef memory | +290 MiB on rank 0, +121 MiB on rank 1 |
+| **Fresh clone of this repository, built from source in a new virtualenv, serving the Hugging Face release** (2026-10-12, PCIe pair) | base outputs **bitwise identical** to the stand runs in production configuration; Clef max \|Δp\| 0.0000 vs those runs and 0.0093 (35/35) vs Cloudflare/clef fp16; images 8/8, mixed load 16/16, 243,173-token needle found; ≥ 660 MiB free at peak |
 | Base model with Clef enabled vs disabled | first token bitwise identical; decode differs at ~1e-3 in logprobs (see below) |
 
 ## Known effects and hazards
