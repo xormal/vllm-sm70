@@ -76,6 +76,17 @@ transformers 4.57.6, triton 3.5.1, …). It then builds `flash-attention-v100` a
 build takes about an hour with `MAX_JOBS=8`. If your pip configuration adds unreachable indexes, run it
 with `PIP_CONFIG_FILE=/dev/null`.
 
+**Offline or slow network.** vLLM's CMake configuration clones its dependencies from GitHub. You can
+point it at local checkouts at the pinned revisions instead:
+
+| Variable | Repository | Revision |
+|---|---|---|
+| `VLLM_CUTLASS_SRC_DIR` | NVIDIA/cutlass | `v4.2.1` |
+| `TRITON_KERNELS_SRC_DIR` | triton-lang/triton, **the `python/triton_kernels/triton_kernels` subdirectory** | `v3.5.0` |
+| `FLASH_MLA_SRC_DIR` | vllm-project/FlashMLA | `c2afa9cb93e674d5a9120a170a6da57b89267208` |
+| `QUTLASS_SRC_DIR` | IST-DASLab/qutlass | `830d2c4537c7396e14a02a46fbddd18b5d107c65` |
+| `VLLM_FLASH_ATTN_SRC_DIR` | vllm-project/flash-attention (with submodules) | `2adfc8c2177c5b0e8ddeedfd5a8990d80eb496ff` |
+
 ## Serving
 
 ```bash
