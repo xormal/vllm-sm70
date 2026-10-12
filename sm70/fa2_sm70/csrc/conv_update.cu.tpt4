@@ -1,0 +1,564 @@
+// СВОЯ свёртка состояния GDN (замена чужому Triton-ядру causal_conv1d_update).
+//
+// ЗАЧЕМ СВОЁ. Три причины, все замерены или прочитаны wcol чужом исходнике:
+//
+//  1. ДЫРА ПО ПОСТРОЕНИЮ. Чужое ядро проверяет координату ЧТЕНИЯ на pad_slot_id ii
+//     делает ранний возврат, а координату ЗАПИСИ не проверяет ничем: при паддинге
+//     (-1) запись уходит ДО начала тензора состояний. Здесь проверяются ОБЕ
+//     координаты И обе колонки (за краем таблицы), то есть дыра закрыта формой
+//     кода, а не заплаткой на маске.
+//  2. ТЕМПОРАЛЬНАЯ УКЛАДКА. Чужое ядро ходит по состоянию ДВАЖДЫ: сперва снимает
+//     W-1 столбцов для свёртки, потом отдельной плитой [NP2_STATELEN, BLOCK_N]
+//     собирает сдвинутое окно на запись, ii между этим стоят два tl.debug_barrier().
+//     Здесь окно снимается ОДИН раз wcol регистры, из тех же регистров считается ii
+//     выход, ii новое состояние: один проход, НОЛЬ барьеров, ноль разделяемой.
+//  3. ПУНКТ 5 ЦЕЛИ. Triton wcol горячем пути -- это питон wcol пути (перекомпиляция,
+//     autotune, разрыв графа при новой форме). Нативное ядро этого не имеет.
+//
+// СЕМАНТИКА взята из чужого ядра дословно (сверяется гейтом тождества):
+//   окно на чтение начинается со смещения принятых токенов (спекуляция),
+//   свёртка берёт W-1 предыдущих столбцов ii текущий токен,
+//   новое состояние = shift окна на shift (1 при спекуляции, seqlen иначе) с
+//   дописанными wcol хвост новыми токенами.
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#define MAX_WIN 16   // W-1 + (seqlen-1); при W=4 ii k<=8 хватает с запасом
+
+template <typename T> __device__ __forceinline__ float to_f(T v);
+template <> __device__ __forceinline__ float to_f<__half>(__half v) { return __half2float(v); }
+template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <typename T> __device__ __forceinline__ T from_f(float v);
+template <> __device__ __forceinline__ __half from_f<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+
+
+// ЯДРО. Ширина W -- ПАРАМЕТР ШАБЛОНА намеренно: при динамическом W массивы окна
+// индексируются переменной и компилятор кладёт их в ЛОКАЛЬНУЮ память, а не в
+// регистры. Замерено 07.09: с динамическим окном B=64 давал x0.52 против чужого,
+// потому что каждая нить ходила в локальную память 128 раз за пуск.
+//
+// БОЛЬШИХ МАССИВОВ ЗДЕСЬ НЕТ ВООБЩЕ. Новое состояние пишется ПО ХОДУ: голова окна
+// (W-2 значений) -- из уже снятых регистров до цикла, хвост -- в тот же миг, когда
+// прочитан очередной входной токен, ДО того как выход затрёт вход на месте.
+// Это и есть темпоральная укладка: один проход по состоянию, ноль барьеров,
+// ноль разделяемой памяти, ни одного повторного чтения.
+template <typename T, int VEC, int W>
+__global__ void conv_upd_k(
+    T* __restrict__ x, T* __restrict__ st_, const T* __restrict__ w_,
+    const T* __restrict__ bias_, const int32_t* __restrict__ tab_,
+    const int32_t* __restrict__ col_r, const int32_t* __restrict__ col_w,
+    const int32_t* __restrict__ nacc, const int32_t* __restrict__ qsl,
+    int B, int dim, int C, int nlines, int win_phys, int WIN, long x_rows,
+    long sx_tok, long ss_seq, long ss_tok, long s_tab, long sw_dim,
+    int pad_id, bool do_silu, bool is_spec)
+{
+  const int row = blockIdx.x;
+  if (row >= B) return;
+
+  // --- ОБЕ КООРДИНАТЫ И ОБЕ КОЛОНКИ. Ровно то, чего нет у чужого ядра. ---
+  const int cr = col_r ? col_r[row] : 0;
+  const int cw = col_w ? col_w[row] : 0;
+  if (cr < 0 || cr >= C || cw < 0 || cw >= C) return;
+  const int line_r = tab_[(long)row * s_tab + cr];
+  const int line_w = tab_[(long)row * s_tab + cw];
+  if (line_r == pad_id || line_w == pad_id) return;
+  if (line_r < 0 || line_r >= nlines || line_w < 0 || line_w >= nlines) return;
+
+  int qs, slen;
+  if (qsl) { qs = qsl[row]; slen = qsl[row + 1] - qs; }
+  else     { qs = row;      slen = 1; }
+  if (slen <= 0) return;
+  // ГРАНИЦА ВХОДА: qsl приходит из чужих метаданных и у паддинговых рядов бывает
+  // устаревшим. Без этой проверки чтение x уходит за буфер (чужое ядро её не имеет).
+  if (qs < 0 || (long)qs + slen > x_rows) return;
+
+  int toff = nacc ? (nacc[row] - 1) : 0;
+  if (toff < 0) toff = 0;
+
+  const int ch = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
+  if (ch >= dim) return;
+
+  const T* base_r = st_ + (long)line_r * ss_seq + ch;
+  T*       base_w = st_ + (long)line_w * ss_seq + ch;
+
+  // окно свёртки: РОВНО W-1 значений, статический массив -> регистры
+  float cur[W - 1][VEC], ini[W - 1][VEC];
+#pragma unroll
+  for (int j = 0; j < W - 1; ++j) {
+    const int t = toff + j;
+    const T* p = base_r + (long)t * ss_tok;
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+      float z = (t < win_phys) ? to_f<T>(p[v]) : 0.f;
+      cur[j][v] = z; ini[j][v] = z;
+    }
+  }
+
+  float wcol[W][VEC], bv[VEC];
+#pragma unroll
+  for (int j = 0; j < W; ++j)
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) wcol[j][v] = to_f<T>(w_[(long)(ch + v) * sw_dim + j]);
+#pragma unroll
+  for (int v = 0; v < VEC; ++v) bv[v] = bias_ ? to_f<T>(bias_[ch + v]) : 0.f;
+
+  // ГОЛОВА нового окна -- из снятых регистров, до всякой записи в x
+#pragma unroll
+  for (int i = 0; i < W - 2; ++i) {
+    if (i >= win_phys) break;
+    T* p = base_w + (long)i * ss_tok;
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) p[v] = from_f<T>(ini[i + 1][v]);
+  }
+
+  for (int t = 0; t < slen; ++t) {
+    T* px = x + (long)(qs + t) * sx_tok + ch;
+    float xt[VEC], acc[VEC];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) { xt[v] = to_f<T>(px[v]); acc[v] = bv[v]; }
+
+    // ХВОСТ нового окна кладётся ЗДЕСЬ: вход ещё не затёрт выходом
+    const int poz = W - 2 + t;
+    if (poz < WIN && poz < win_phys) {
+      T* ps = base_w + (long)poz * ss_tok;
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) ps[v] = from_f<T>(xt[v]);
+    }
+
+#pragma unroll
+    for (int j = 0; j < W - 1; ++j)
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) acc[v] += cur[j][v] * wcol[j][v];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+      acc[v] += xt[v] * wcol[W - 1][v];
+      if (do_silu) acc[v] = acc[v] / (1.f + __expf(-acc[v]));
+      px[v] = from_f<T>(acc[v]);
+    }
+#pragma unroll
+    for (int j = 0; j < W - 2; ++j)
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) cur[j][v] = cur[j + 1][v];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) cur[W - 2][v] = xt[v];
+  }
+  (void)is_spec;
+}
+
+static inline int64_t div_up(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+torch::Tensor conv1d_update(
+    torch::Tensor x, torch::Tensor st_, torch::Tensor w_,
+    c10::optional<torch::Tensor> bias_, bool do_silu,
+    torch::Tensor tab_,
+    c10::optional<torch::Tensor> col_r, c10::optional<torch::Tensor> col_w,
+    c10::optional<torch::Tensor> nacc, c10::optional<torch::Tensor> qsl,
+    int64_t max_qlen, int64_t pad_id)
+{
+  TORCH_CHECK(x.is_cuda() && st_.is_cuda(), "нужны тензоры на GPU");
+  TORCH_CHECK(st_.dim() == 3, "состояние ожидается [строки, dim, окно]");
+  TORCH_CHECK(st_.stride(1) == 1, "состояние обязано быть непрерывным по каналу");
+  TORCH_CHECK(x.stride(-1) == 1, "вход обязан быть непрерывным по каналу");
+
+  const int B = (int)tab_.size(0);
+  const int C = (int)tab_.size(1);
+  const int dim = (int)x.size(-1);
+  const int W = (int)w_.size(1);
+  const int nlines = (int)st_.size(0);
+  const int win_phys = (int)st_.size(2);
+  const bool is_spec = nacc.has_value();
+  const int qlen_max = qsl.has_value() ? (int)max_qlen : 1;
+  const int WIN = is_spec ? (W - 1 + qlen_max - 1) : (W - 1);
+  TORCH_CHECK(WIN <= MAX_WIN, "окно состояния больше MAX_WIN");
+
+  const int32_t* p_cr  = col_r.has_value()  ? col_r->data_ptr<int32_t>()  : nullptr;
+  const int32_t* p_cw = col_w.has_value() ? col_w->data_ptr<int32_t>() : nullptr;
+  const int32_t* p_acc  = nacc.has_value() ? nacc->data_ptr<int32_t>() : nullptr;
+  const int32_t* p_qsl  = qsl.has_value() ? qsl->data_ptr<int32_t>() : nullptr;
+
+  TORCH_CHECK(x.dim() == 2, "вход ожидается [токены, dim]");
+  const long sx_tok = x.stride(0);
+  const long x_rows = x.size(0);
+  const long ss_seq = st_.stride(0), ss_tok = st_.stride(2);
+  const long s_tab = tab_.stride(0), sw_dim = w_.stride(0);
+
+  // векторизация только когда ВСЕ шаги кратны вектору (иначе скалярный путь)
+  int VEC = 1;
+  if (dim % 8 == 0 && ss_seq % 8 == 0 && ss_tok % 8 == 0 && sx_tok % 8 == 0) VEC = 8;
+  else if (dim % 2 == 0 && ss_seq % 2 == 0 && ss_tok % 2 == 0 && sx_tok % 2 == 0) VEC = 2;
+
+  const int nthr = 128;
+  auto stream_ = at::cuda::getCurrentCUDAStream();
+#define LAUNCH(T, V, WW)                                                              \
+  do {                                                                                \
+    dim3 grid_(B, (unsigned)div_up(div_up(dim, V), nthr));                            \
+    conv_upd_k<T, V, WW><<<grid_, nthr, 0, stream_>>>(                                \
+        (T*)x.data_ptr(), (T*)st_.data_ptr(), (const T*)w_.data_ptr(),                \
+        bias_.has_value() ? (const T*)bias_->data_ptr() : nullptr,                    \
+        tab_.data_ptr<int32_t>(), p_cr, p_cw, p_acc, p_qsl,                           \
+        B, dim, C, nlines, win_phys, WIN, x_rows,                                     \
+        sx_tok, ss_seq, ss_tok, s_tab, sw_dim, (int)pad_id, do_silu, is_spec);        \
+  } while (0)
+#define BY_WIDTH(T, V)                                                               \
+  do {                                                                                \
+    switch (W) {                                                                      \
+      case 2: LAUNCH(T, V, 2); break;                                                 \
+      case 3: LAUNCH(T, V, 3); break;                                                 \
+      case 4: LAUNCH(T, V, 4); break;                                                 \
+      case 5: LAUNCH(T, V, 5); break;                                                 \
+      case 6: LAUNCH(T, V, 6); break;                                                 \
+      default: TORCH_CHECK(false, "ширина ядра вне поддержки");                       \
+    }                                                                                 \
+  } while (0)
+
+  if (st_.scalar_type() == at::kHalf) {
+    if (VEC == 8) BY_WIDTH(__half, 8); else if (VEC == 2) BY_WIDTH(__half, 2); else BY_WIDTH(__half, 1);
+  } else if (st_.scalar_type() == at::kBFloat16) {
+    if (VEC == 8) BY_WIDTH(__nv_bfloat16, 8); else if (VEC == 2) BY_WIDTH(__nv_bfloat16, 2); else BY_WIDTH(__nv_bfloat16, 1);
+  } else {
+    TORCH_CHECK(false, "поддержаны только fp16 и bf16");
+  }
+#undef BY_WIDTH
+#undef LAUNCH
+  return x;
+}
+
+bool conv1d_update_available() { return true; }
+
+
+
+// ===========================================================================
+// ВТОРОЕ чужое ядро -- causal_conv1d_fn (префилл и не-спекулятивный декод).
+//
+// ГЛАВНОЕ НАБЛЮДЕНИЕ: причинная свёртка ширины W по последовательности НЕ имеет
+// рекуррентности -- выходу в позиции p нужны ровно x[p-W+1..p], а начальное
+// состояние подставляет отрицательные позиции. Значит задача полностью
+// параллельна по токенам, и вся чужая машинерия чанков (BLOCK_M = ВОСЕМЬ токенов
+// на программу, таблицы batch_ptr/token_chunk_offset, MAX_NUM_PROGRAMS=1024)
+// нужна только чтобы раздать работу -- а не по существу.
+//
+// ТЕМПОРАЛЬНАЯ УКЛАДКА ЗДЕСЬ ИНАЯ, ЧЕМ В ОБНОВЛЕНИИ: там укладывались стадии
+// одного ряда, здесь -- разделяются две НЕЗАВИСИМЫЕ работы, которые чужое ядро
+// переплело в одной программе через chunk_offset: счёт выхода и сохранение
+// состояний на границах блоков. Обе читают x и не зависят друг от друга, поэтому
+// идут двумя ядрами без единого барьера, каждое со своей естественной сеткой.
+//
+// x РАСКЛАДКА: (dim, токены), непрерывно ПО ТОКЕНАМ -- поэтому нить берёт VEC
+// подряд идущих ТОКЕНОВ одного канала (у обновления было наоборот, VEC каналов).
+// ===========================================================================
+
+// значение входа в позиции p последовательности: x при p>=0, иначе начальное состояние
+template <typename T, int W>
+__device__ __forceinline__ float _val_in(const T* xseq, long p, const T* stbase,
+                                         long ss_tok, bool has_init, long sx_tok = 1)
+{
+  if (p >= 0) return to_f<T>(xseq[p * sx_tok]);
+  if (!has_init) return 0.f;
+  const long i = (long)(W - 1) + p;          // p in [-(W-1), -1] -> i in [0, W-2]
+  if (i < 0) return 0.f;
+  return to_f<T>(stbase[i * ss_tok]);
+}
+
+template <typename T, int VEC, int W>
+__global__ void conv_fn_out_k(
+    const T* __restrict__ x, T* __restrict__ out, const T* __restrict__ w_,
+    const T* __restrict__ bias_, const T* __restrict__ st_,
+    const int32_t* __restrict__ tab_, const int32_t* __restrict__ col_init,
+    const bool* __restrict__ has_init, const int32_t* __restrict__ qsl,
+    int dim, int C, int nlines, long sx_dim, long sx_tok, long ss_seq, long ss_tok,
+    long s_tab, long sw_dim, int pad_id, bool do_silu)
+{
+  const int seq = blockIdx.z;
+  const long qs = qsl[seq], qe = qsl[seq + 1];
+  const long slen = qe - qs;
+  if (slen <= 0) return;
+
+  const int ch = blockIdx.y * blockDim.y + threadIdx.y;
+  if (ch >= dim) return;
+  const long p0 = (long)(blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+  if (p0 >= slen) return;
+
+  // начальное состояние: колонка ЧТЕНИЯ проверяется, как и всё остальное
+  bool hi = has_init ? has_init[seq] : false;
+  const T* stbase = nullptr;
+  if (hi) {
+    const int ci = col_init ? col_init[seq] : 0;
+    if (ci < 0 || ci >= C) { hi = false; }
+    else {
+      const int line = tab_[(long)seq * s_tab + ci];
+      if (line == pad_id || line < 0 || line >= nlines) hi = false;
+      else stbase = st_ + (long)line * ss_seq + (long)ch /*stride_dim == 1*/;
+    }
+  }
+
+  const T* xseq = x + (long)ch * sx_dim + qs * sx_tok;
+  T* oseq = out + (long)ch * sx_dim + qs * sx_tok;
+
+  float wc[W];
+#pragma unroll
+  for (int j = 0; j < W; ++j) wc[j] = to_f<T>(w_[(long)ch * sw_dim + j]);
+  const float bv = bias_ ? to_f<T>(bias_[ch]) : 0.f;
+
+  // окно из VEC+W-1 подряд идущих значений -- читается ОДИН раз на VEC выходов
+  float buf[VEC + W - 1];
+#pragma unroll
+  for (int i = 0; i < VEC + W - 1; ++i)
+    buf[i] = _val_in<T, W>(xseq, p0 - (W - 1) + i, stbase, ss_tok, hi, sx_tok);
+
+#pragma unroll
+  for (int v = 0; v < VEC; ++v) {
+    const long p = p0 + v;
+    if (p >= slen) break;
+    float acc = bv;
+#pragma unroll
+    for (int j = 0; j < W; ++j) acc += buf[v + j] * wc[j];
+    if (do_silu) acc = acc / (1.f + __expf(-acc));
+    oseq[p * sx_tok] = from_f<T>(acc);
+  }
+}
+
+
+// ВАРИАНТ ПОД БОЕВУЮ РАСКЛАДКУ: x непрерывен ПО КАНАЛАМ (транспонированный вид).
+// Здесь нить обязана брать подряд идущие КАНАЛЫ, иначе чтение рассыпается: замерено
+// x0.21 у варианта "нить = токены" на этой же раскладке. Токенов на нить -- TPT,
+// чтобы окно из W-1+TPT значений читалось один раз на TPT выходов.
+template <typename T, int VEC, int W, int TPT>
+__global__ void conv_fn_out_dm_k(
+    const T* __restrict__ x, T* __restrict__ out, const T* __restrict__ w_,
+    const T* __restrict__ bias_, const T* __restrict__ st_,
+    const int32_t* __restrict__ tab_, const int32_t* __restrict__ col_init,
+    const bool* __restrict__ has_init, const int32_t* __restrict__ qsl,
+    int dim, int C, int nlines, long sx_tok, long ss_seq, long ss_tok,
+    long s_tab, long sw_dim, int pad_id, bool do_silu)
+{
+  const int seq = blockIdx.z;
+  const long qs = qsl[seq], qe = qsl[seq + 1];
+  const long slen = qe - qs;
+  if (slen <= 0) return;
+  const int ch = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+  if (ch >= dim) return;
+  const long p0 = (long)blockIdx.y * TPT;
+  if (p0 >= slen) return;
+
+  bool hi = has_init ? has_init[seq] : false;
+  const T* stbase = nullptr;
+  if (hi) {
+    const int ci = col_init ? col_init[seq] : 0;
+    if (ci < 0 || ci >= C) hi = false;
+    else {
+      const int line = tab_[(long)seq * s_tab + ci];
+      if (line == pad_id || line < 0 || line >= nlines) hi = false;
+      else stbase = st_ + (long)line * ss_seq + (long)ch;
+    }
+  }
+  const T* xseq = x + qs * sx_tok + ch;
+  T* oseq = out + qs * sx_tok + ch;
+
+  float wc[W][VEC], bv[VEC];
+#pragma unroll
+  for (int j = 0; j < W; ++j)
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) wc[j][v] = to_f<T>(w_[(long)(ch + v) * sw_dim + j]);
+#pragma unroll
+  for (int v = 0; v < VEC; ++v) bv[v] = bias_ ? to_f<T>(bias_[ch + v]) : 0.f;
+
+  float buf[W - 1 + TPT][VEC];
+#pragma unroll
+  for (int i = 0; i < W - 1 + TPT; ++i) {
+    const long p = p0 - (W - 1) + i;
+    if (p >= 0) {
+      const T* px = xseq + p * sx_tok;
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) buf[i][v] = (p < slen) ? to_f<T>(px[v]) : 0.f;
+    } else if (hi) {
+      const long ii = (long)(W - 1) + p;
+      const T* ps = stbase + ii * ss_tok;
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) buf[i][v] = (ii >= 0) ? to_f<T>(ps[v]) : 0.f;
+    } else {
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) buf[i][v] = 0.f;
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < TPT; ++t) {
+    const long p = p0 + t;
+    if (p >= slen) break;
+    T* px = oseq + p * sx_tok;
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+      float acc = bv[v];
+#pragma unroll
+      for (int j = 0; j < W; ++j) acc += buf[t + j][v] * wc[j][v];
+      if (do_silu) acc = acc / (1.f + __expf(-acc));
+      px[v] = from_f<T>(acc);
+    }
+  }
+}
+
+// сохранение состояний: последнее (в колонку current_last) и промежуточные на
+// границах блоков (в колонки current_first + c). Работа независимая от выхода.
+template <typename T, int W>
+__global__ void conv_fn_state_k(
+    const T* __restrict__ x, T* __restrict__ st_, const T* __restrict__ st_ro,
+    const int32_t* __restrict__ tab_, const int32_t* __restrict__ col_init,
+    const int32_t* __restrict__ col_first, const int32_t* __restrict__ col_last,
+    const int32_t* __restrict__ ncomp, const bool* __restrict__ has_init,
+    const int32_t* __restrict__ qsl, int dim, int C, int nlines, int B_size,
+    long x_tokens, long sx_dim, long sx_tok, long ss_seq, long ss_tok, long s_tab, int pad_id)
+{
+  const int seq = blockIdx.z;
+  const long qs = qsl[seq], qe = qsl[seq + 1];
+  const long slen = qe - qs;
+  if (slen <= 0) return;
+  const int ch = blockIdx.y * blockDim.x + threadIdx.x;
+  if (ch >= dim) return;
+
+  const int c_first = col_first ? col_first[seq] : 0;
+  const int c_last  = col_last  ? col_last[seq]  : 0;
+  if (c_first < 0 || c_last < 0 || c_first >= C || c_last >= C) return;
+  const int n_fill = c_last - c_first;
+  const int what = blockIdx.x;                 // 0 -- последнее, 1..n_fill -- промежуточные
+  if (what > n_fill) return;
+  // без размера блока промежуточных записей не бывает (и делить на ноль нельзя)
+  if (what > 0 && B_size <= 0) return;
+
+  // СЕМАНТИКА ЧУЖОГО ЯДРА, снятая гейтом: когда длина МЕНЬШЕ окна состояния, оно
+  // пишет обновлённое окно не в колонку записи, а ОБРАТНО в блок чтения (ветка
+  // state_len > seqlen пишет по conv_states_base). Повторено дословно, иначе на
+  // коротких шагах состояние уезжает не в тот блок.
+  const bool корот = (slen < (long)(W - 1));
+  const int cw = (what == 0) ? (корот ? (col_init ? col_init[seq] : 0) : c_last)
+                             : (c_first + what - 1);
+  if (cw < 0 || cw >= C) return;
+  const int line_w = tab_[(long)seq * s_tab + cw];
+  if (line_w == pad_id || line_w < 0 || line_w >= nlines) return;
+
+  bool hi = has_init ? has_init[seq] : false;
+  const T* stbase = nullptr;
+  if (hi) {
+    const int ci = col_init ? col_init[seq] : 0;
+    if (ci < 0 || ci >= C) hi = false;
+    else {
+      const int lr = tab_[(long)seq * s_tab + ci];
+      if (lr == pad_id || lr < 0 || lr >= nlines) hi = false;
+      else stbase = st_ro + (long)lr * ss_seq + (long)ch;
+    }
+  }
+  const T* xseq = x + (long)ch * sx_dim + qs * sx_tok;
+  T* dst = st_ + (long)line_w * ss_seq + (long)ch;
+
+  if (what == 0) {
+    // последнее состояние: хвост из state_len значений последовательности
+#pragma unroll
+    for (int i = 0; i < W - 1; ++i)
+      dst[(long)i * ss_tok] =
+          from_f<T>(_val_in<T, W>(xseq, slen - (W - 1) + i, stbase, ss_tok, hi, sx_tok));
+  } else {
+    // промежуточное: окно, кончающееся на границе блока (координаты АБСОЛЮТНЫЕ)
+    const long comp = ncomp ? (long)ncomp[seq] : 0;
+    const long off_tok = comp % (long)B_size;
+    const long compl_off = (long)B_size - off_tok;
+    long e = (slen - compl_off) % (long)B_size;
+    if (e < 0) e += (long)B_size;                       // питонов остаток, не сишный
+    long last_full = qe - e;
+    if (e == 0) last_full -= (long)B_size;
+    const long конец = last_full - (long)(n_fill - what) * (long)B_size;
+    const T* xabs = x + (long)ch * sx_dim;
+#pragma unroll
+    for (int i = 0; i < W - 1; ++i) {
+      const long t = конец - (W - 1) + i;
+      float v = (t >= 0 && t < x_tokens) ? to_f<T>(xabs[t * sx_tok]) : 0.f;  // верхняя граница -- наша
+      dst[(long)i * ss_tok] = from_f<T>(v);
+    }
+  }
+}
+
+torch::Tensor conv1d_fn(
+    torch::Tensor x, torch::Tensor w_, c10::optional<torch::Tensor> bias_, bool do_silu,
+    torch::Tensor st_, c10::optional<torch::Tensor> has_init, torch::Tensor tab_,
+    c10::optional<torch::Tensor> col_first, c10::optional<torch::Tensor> col_last,
+    c10::optional<torch::Tensor> col_init, c10::optional<torch::Tensor> ncomp,
+    int64_t B_size, torch::Tensor qsl, int64_t pad_id)
+{
+  // РАСКЛАДКА x ЛЮБАЯ ИЗ ДВУХ. В бою сюда приходит ТРАНСПОНИРОВАННЫЙ вид
+  // (непрерывный по каналам), а не по токенам -- проверка формы это поймала, и
+  // вместо отказа ядро теперь берёт оба шага.
+  TORCH_CHECK(x.dim() == 2, "x ожидается (dim, токены)");
+  TORCH_CHECK(st_.dim() == 3 && st_.stride(1) == 1, "состояние [строки, dim, окно], непрерывно по каналу");
+  const int dim = (int)x.size(0);
+  const long x_tokens = x.size(1);
+  const int W = (int)w_.size(1);
+  const int B = (int)qsl.size(0) - 1;
+  const int C = (int)tab_.size(1);
+  const int nlines = (int)st_.size(0);
+  auto out = torch::empty_like(x);
+
+  const int32_t* p_first = col_first.has_value() ? col_first->data_ptr<int32_t>() : nullptr;
+  const int32_t* p_last  = col_last.has_value()  ? col_last->data_ptr<int32_t>()  : nullptr;
+  const int32_t* p_init  = col_init.has_value()  ? col_init->data_ptr<int32_t>()  : nullptr;
+  const int32_t* p_nc    = ncomp.has_value()     ? ncomp->data_ptr<int32_t>()     : nullptr;
+  const bool*    p_hi    = has_init.has_value()  ? has_init->data_ptr<bool>()     : nullptr;
+  const long sx_dim = x.stride(0), sx_tok = x.stride(1);
+  const long ss_seq = st_.stride(0), ss_tok = st_.stride(2);
+  const long s_tab = tab_.stride(0), sw_dim = w_.stride(0);
+  auto stream_ = at::cuda::getCurrentCUDAStream();
+
+  long max_len = x_tokens;   // верхняя оценка длины любой последовательности
+#define FN_LAUNCH(T, V, WW)                                                             \
+  do {                                                                                  \
+    dim3 blk(32, 8);                                                                    \
+    dim3 g((unsigned)div_up(div_up(max_len, V), 32), (unsigned)div_up(dim, 8), B);    \
+    if (sx_dim == 1) {                                                                  \
+      dim3 blkd(128);                                                                    \
+      dim3 gd((unsigned)div_up(div_up(dim, 8), 128), (unsigned)div_up(max_len, 4), B);   \
+      conv_fn_out_dm_k<T, 8, WW, 4><<<gd, blkd, 0, stream_>>>(                           \
+          (const T*)x.data_ptr(), (T*)out.data_ptr(), (const T*)w_.data_ptr(),           \
+          bias_.has_value() ? (const T*)bias_->data_ptr() : nullptr, (const T*)st_.data_ptr(), \
+          tab_.data_ptr<int32_t>(), p_init, p_hi, qsl.data_ptr<int32_t>(),               \
+          dim, C, nlines, sx_tok, ss_seq, ss_tok, s_tab, sw_dim, (int)pad_id, do_silu);  \
+    } else                                                                               \
+    conv_fn_out_k<T, V, WW><<<g, blk, 0, stream_>>>(                                    \
+        (const T*)x.data_ptr(), (T*)out.data_ptr(), (const T*)w_.data_ptr(),            \
+        bias_.has_value() ? (const T*)bias_->data_ptr() : nullptr, (const T*)st_.data_ptr(), \
+        tab_.data_ptr<int32_t>(), p_init, p_hi, qsl.data_ptr<int32_t>(),                \
+        dim, C, nlines, sx_dim, sx_tok, ss_seq, ss_tok, s_tab, sw_dim, (int)pad_id, do_silu); \
+    dim3 g2((unsigned)C, (unsigned)div_up(dim, 128), B);                                \
+    conv_fn_state_k<T, WW><<<g2, 128, 0, stream_>>>(                                    \
+        (const T*)x.data_ptr(), (T*)st_.data_ptr(), (const T*)st_.data_ptr(),           \
+        tab_.data_ptr<int32_t>(), p_init, p_first, p_last, p_nc, p_hi,                  \
+        qsl.data_ptr<int32_t>(), dim, C, nlines, (int)B_size, x_tokens,                 \
+        sx_dim, sx_tok, ss_seq, ss_tok, s_tab, (int)pad_id);                            \
+  } while (0)
+#define FN_BY_W(T, V)                                                                   \
+  do {                                                                                  \
+    switch (W) {                                                                        \
+      case 2: FN_LAUNCH(T, V, 2); break;                                                \
+      case 3: FN_LAUNCH(T, V, 3); break;                                                \
+      case 4: FN_LAUNCH(T, V, 4); break;                                                \
+      default: TORCH_CHECK(false, "ширина вне поддержки");                              \
+    }                                                                                   \
+  } while (0)
+  const bool tok_cont = (sx_tok == 1);
+  if (st_.scalar_type() == at::kHalf) {
+    if (tok_cont) FN_BY_W(__half, 8); else FN_BY_W(__half, 1);
+  } else if (st_.scalar_type() == at::kBFloat16) {
+    if (tok_cont) FN_BY_W(__nv_bfloat16, 8); else FN_BY_W(__nv_bfloat16, 1);
+  }
+  else TORCH_CHECK(false, "только fp16/bf16");
+#undef FN_BY_W
+#undef FN_LAUNCH
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("conv1d_update", &conv1d_update,
+        "СВОЯ свёртка состояния GDN: обе координаты проверены, один проход, ноль барьеров");
+  m.def("conv1d_fn", &conv1d_fn,
+        "СВОЯ причинная свёртка (замена causal_conv1d_fn): выход и состояния -- два независимых ядра");
+  m.def("conv1d_update_available", &conv1d_update_available, "признак присутствия");
+}
