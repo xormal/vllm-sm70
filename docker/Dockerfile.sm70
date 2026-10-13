@@ -2,7 +2,7 @@
 # vllm-sm70: Qwen3.8-27B-ABLITERATED GPTQ-Int8 + Clef (/v1/systemone) on NVIDIA V100 (sm_70).
 # One image for every supported layout: 2, 4 or 8 cards, 16 or 32 GB, NVLink, PCIe or mixed.
 #
-#   docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .            # ~1.5 h, no GPU needed
+#   docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .            # hours, no GPU needed
 #   scripts/plan_gpus.py --out deploy/ && cd deploy && MODEL_DIR=/models/... docker compose up -d
 #
 # The model is NOT in the image: mount the Hugging Face release at /models/model (read-only).
@@ -36,25 +36,31 @@ RUN pip install --upgrade pip && pip install -r /opt/vllm-sm70/requirements-sm70
 
 # 2. vLLM (1Cat-vLLM with the sm70 runtime) and flash-attention-v100, built for sm_70 from this
 #    repository -- the same steps as scripts/install_from_source.sh. The sm70/ tree, scripts and docs come
-#    later so that editing them does not rebuild vLLM (about an hour); pyproject.toml only needs a README
-#    to exist, the real ones are copied at the end.
+#    later so that editing them does not rebuild vLLM (3.8 h at MAX_JOBS=6 on 24 cores); pyproject.toml
+#    only needs a README to exist, the real ones are copied at the end.
 COPY --exclude=sm70 --exclude=scripts --exclude=configs --exclude=docs --exclude=docker --exclude=*.md \
      . /opt/vllm-sm70
 WORKDIR /opt/vllm-sm70
+RUN FLASH_ATTN_V100_ALLOW_NO_GPU=1 MAX_JOBS=${MAX_JOBS} NVCC_THREADS=1 \
+        pip install --no-build-isolation --no-deps ./flash-attention-v100
 RUN printf '# vllm-sm70\n' > README.md \
-    && MAX_JOBS=${MAX_JOBS} NVCC_THREADS=1 pip install --no-build-isolation --no-deps ./flash-attention-v100 \
     && MAX_JOBS=${MAX_JOBS} NVCC_THREADS=1 VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE} \
        pip install --no-build-isolation --no-deps -e . \
     && rm -rf build .deps/*-build .deps/*-subbuild
 
 # 3. The fa2_sm70 kernels, compiled ahead of time without a GPU (FA2SM70_PREBUILD=1). The build directory
-#    lives in the image, not in /state, so a new volume does not trigger a 20-minute JIT build. torch
-#    re-runs ninja on load, so the directory must stay writable by the runtime user.
-COPY sm70 /opt/vllm-sm70/sm70
+#    lives in the image, not in /state, so a new volume does not trigger a 25-minute JIT build. torch
+#    re-runs ninja on load, so the directory must stay writable by the runtime user. Only the kernel
+#    sources come before the build: tests and the vLLM integration change more often, and they are
+#    copied after it (never over the sources, which would make ninja rebuild at start-up).
+COPY sm70/fa2_sm70 /opt/vllm-sm70/sm70/fa2_sm70
+COPY sm70/fa2_src /opt/vllm-sm70/sm70/fa2_src
+COPY sm70/third_party /opt/vllm-sm70/sm70/third_party
 ENV FA2SM70_PATH=/opt/vllm-sm70/sm70 \
     PYTHONPATH=/opt/vllm-sm70/sm70/integrations/vllm_sm70:/opt/vllm-sm70/sm70 \
     FA2SM70_BUILD_DIR=/opt/vllm-sm70/build
 RUN FA2SM70_PREBUILD=1 python -m fa2_sm70.prebuild
+COPY --exclude=fa2_sm70 --exclude=fa2_src --exclude=third_party sm70 /opt/vllm-sm70/sm70
 
 # 4. Launcher, lever files, profiles, planner, container helpers, docs.
 COPY scripts /opt/vllm-sm70/scripts

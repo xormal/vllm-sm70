@@ -149,7 +149,7 @@ int8-ядра GEMM добавляют две поправки:
 по UUID, впереди nginx.
 
 ```bash
-docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~1.5 ч, GPU не нужен
+docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~4 ч, GPU не нужен
 scripts/plan_gpus.py --gpus 0,1,2,3 --out deploy/                      # или все карты / GPU-UUID / --single
 cd deploy && MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef docker compose up -d
 ```

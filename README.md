@@ -194,7 +194,7 @@ One image for 2, 4 or 8 V100 cards, 16 or 32 GB, NVLink, PCIe or mixed. A planne
 by topology and writes a compose file with one replica per group, pinned by GPU UUID, behind nginx:
 
 ```bash
-docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~1.5 h, no GPU needed
+docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~4 h, no GPU needed
 scripts/plan_gpus.py --gpus 0,1,2,3 --out deploy/                      # or all cards / GPU-UUIDs / --single
 cd deploy && MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef docker compose up -d
 ```

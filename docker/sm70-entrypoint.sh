@@ -15,7 +15,7 @@ case "$cmd" in
     rm -f /tmp/sm70-ready
     "$R/docker/sm70-warmup.sh" &
     exec "$R/scripts/serve_qwen38_clef.sh" "$@" ;;
-  plan) exec "$PY" "$R/scripts/plan_gpus.py" "$@" ;;
+  plan) exec "$PY" -I "$R/scripts/plan_gpus.py" "$@" ;;     # standard library only: skip sitecustomize
   prebuild) exec "$PY" -m fa2_sm70.prebuild "$@" ;;
   gates) exec "$PY" "$R/sm70/integrations/vllm_sm70/clef/proverka_stenda.py" "$@" ;;
   *) exec "$cmd" "$@" ;;

@@ -74,7 +74,9 @@ def get_cmdclass():
     class CustomBuildExtension(BuildExtension):
         def build_extensions(self):
             import torch
-            if not torch.cuda.is_available():
+            # FLASH_ATTN_V100_ALLOW_NO_GPU=1 (vllm-sm70): build without a visible GPU, e.g. in `docker build`.
+            # The target is fixed by -gencode arch=compute_70,code=sm_70 above, so no device is needed.
+            if not torch.cuda.is_available() and os.environ.get("FLASH_ATTN_V100_ALLOW_NO_GPU") != "1":
                 raise RuntimeError("CUDA is required but not available.")
             if parse(torch.version.cuda) < parse("11.6"):
                 raise RuntimeError(

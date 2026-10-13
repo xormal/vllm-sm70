@@ -15,8 +15,9 @@ and every group runs one replica in its own container behind nginx.
 ## Host requirements
 
 * NVIDIA driver >= 570 (CUDA 12.8).
-* Docker >= 25 with Compose v2, and the NVIDIA Container Toolkit. With CDI the Docker daemon does not
-  need a restart:
+* Docker with Compose v2 and CDI, and the NVIDIA Container Toolkit. Docker 28 has CDI on: `docker info`
+  lists `CDI spec directories`. Older Docker needs `"features": {"cdi": true}` in `daemon.json`. With
+  CDI the Docker daemon does not need a restart for the toolkit:
 
   ```bash
   sudo apt-get install -y nvidia-container-toolkit        # NVIDIA's apt repository
@@ -26,7 +27,8 @@ and every group runs one replica in its own container behind nginx.
 
   Without CDI, use the classic runtime (`nvidia-ctk runtime configure --runtime=docker`, then restart
   dockerd) and pass `--runtime nvidia` to the planner.
-* About 40 GB of disk for the image and its build cache, 35 GB for the model, a few GB per replica in `/state`.
+* About 22 GB for the image (plus its build cache while building), 35 GB for the model, a few GB per replica
+  in `/state`.
 
 ## Build
 
@@ -34,14 +36,17 @@ and every group runs one replica in its own container behind nginx.
 docker build -f docker/Dockerfile.sm70 --build-arg MAX_JOBS=8 -t vllm-sm70:$(git rev-parse --short HEAD) .
 ```
 
-About 1.5 hours without a GPU: vLLM for `sm_70` takes most of it, the fa2_sm70 kernels about 20 minutes.
-Layers are ordered so that editing `sm70/` rebuilds only the kernels, and editing scripts, configs or docs
-rebuilds nothing heavy. `MAX_JOBS` costs ~3 GB of RAM per job.
+No GPU is needed. Measured on the reference host (24 cores, `MAX_JOBS=6`): flash-attention 3 min, vLLM
+for `sm_70` 3.8 h, the fa2_sm70 kernels 25 min. Layers are ordered so that editing the kernel sources
+(`sm70/fa2_sm70`, `sm70/fa2_src`, `sm70/third_party`) rebuilds only the kernels, and editing the rest of
+`sm70/`, scripts, configs or docs rebuilds nothing heavy. `MAX_JOBS` costs ~3 GB of RAM per job.
 
 ## Plan and run
 
 ```bash
 scripts/plan_gpus.py --out deploy/                 # all cards; or --gpus 2,3,6,7 / --gpus GPU-<uuid>,...
+# or from the image, as your user:  docker run --rm --device nvidia.com/gpu=all -u $(id -u):$(id -g) \
+#                                       -v $PWD/deploy:/out vllm-sm70:<tag> plan --out /out
 cd deploy && MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef SM70_IMAGE=vllm-sm70:<tag> \
     docker compose up -d
 docker compose ps                                  # healthy = the replica has answered a chat and a Clef request
@@ -121,8 +126,10 @@ derivation and the calibration procedure. A 16 GB layout can be rehearsed on 32 
 |---|---|---|
 | TP=2, 32 GB, NVLink and PCIe | reference host, outside Docker | production since 2026-09; gates in VALIDATION.md |
 | Kernels compiled without a GPU (`FA2SM70_PREBUILD=1`) | reference host | same nvcc flags as the production build (`sm_70`), loads without a device |
+| Image build | reference host, no GPU in the build | built; vLLM, torch 2.9.1+cu128 and flash-attention import; the prebuilt kernels load with the production levers without recompiling (10 s) |
 | Launcher at 2/4/8 cards, by index and by UUID | reference host, dry runs | TP=2 environment and command identical to the previous launcher |
-| Planner | CI fixtures | 13 tests |
+| Launcher inside the image | recorded topologies seen as a container sees them (`sm70/tests/fake_nvidia_smi.py`) | 12 tests: profile, TP and exchange for 2/4/8 cards, 16 and 32 GB, UUIDs, refusals |
+| Planner | recorded topologies | 13 tests; `compose.yaml` passes `docker compose config` |
 | Encoder scheduling for the MTP drafter (`FA2SM70_MM_DRAFT_SHIFT`) | CPU test + production, 2026-10-13 | see VALIDATION.md, incident 2026-10-13 |
 | Clef split at TP=8 (KV heads replicated) | CPU, real adapters | rows equal vLLM's sharding at TP=1/2/4/8; TP=2 bitwise unchanged |
 | Image on GPUs, TP=4, 16 GB profiles, 8 cards | not yet | needs GPU windows / hardware |
