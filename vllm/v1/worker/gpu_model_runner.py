@@ -2871,6 +2871,15 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
+                if (encoder_output is None and shift_computed_tokens > 0
+                        and _os.environ.get("FA2SM70_MM_DRAFT_SHIFT", "0") == "1"):
+                    # [FA2/SM70 13.10] Черновик -- только ускорение: его токены проверяет цель. Нет
+                    # выхода энкодера для окна черновика -- позиции остаются эмбеддингами токенов
+                    # (черновик чуть хуже на шаг), а не assert, который роняет движок.
+                    # Планировщик с тем же рычагом этот случай уже закрывает; здесь страховка.
+                    logger.warning_once("[fa2_sm70] черновик: нет выхода энкодера %s в окне черновика, "
+                                        "позиции картинки идут без эмбеддингов", mm_hash)
+                    continue
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:

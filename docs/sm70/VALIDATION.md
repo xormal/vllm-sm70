@@ -76,6 +76,43 @@ connector and the processor separately on plain PIL images and missed it. The en
 image for counting only and hands the wrapper to the engine, like chat does; the offline gate runs the
 whole chain and fails on the old code with the same error.
 
+### Incident 2026-10-13: `Encoder cache miss` in the MTP drafter
+
+**What happened.** Production died at 14:42 with `AssertionError: Encoder cache miss` in
+`propose_draft_token_ids → _gather_mm_embeddings`. Before that it had served ~11 hours and 4,805 Clef
+records, most of them with images. The autostart loop brought it back in 6 minutes.
+
+**Cause: a vLLM scheduler defect, made frequent by Clef records with images.**
+* The MTP/eagle drafter reads the target's window shifted by one position.
+* `_try_schedule_encoder_inputs` honours that shift when deciding whether an image is needed at all,
+  but not when it checks whether the window contains any of the image's embeddings.
+* So when a prefill chunk ends exactly at an image's first token and the image is not cached, the
+  encoder is skipped while the drafter reads that token.
+* Clef records put the image right after `STATE:`, at a fixed offset. Under mixed load a chunk
+  sometimes ends exactly there.
+* The assertion had never appeared in the logs before images were enabled for Clef.
+
+**Fix: `FA2SM70_MM_DRAFT_SHIFT=1`.** It is a lever because the virtualenv is shared.
+* The scheduler includes the drafter's shift in that check.
+* The drafter skips a missing encoder output with a one-time warning instead of asserting. This is a
+  safety net only: draft tokens are verified by the target anyway.
+
+**Validation:**
+* `sm70/tests/test_mm_draft_shift.py` (CPU) reproduces the defect with the lever off and passes with it
+  on; neighbouring cases schedule no extra encoder work.
+* In production, on an idle server, a chat whose image starts exactly at position 2048 (the first
+  chunk boundary) was answered correctly ("Blue.") with no warning in the log; before the fix this
+  request crashes the engine.
+* After the restart:
+  * Clef with images 16/16;
+  * chat images 8/8 together with Clef 2/2;
+  * Clef text 34/35 against 2026-10-12: max |Δp| 0.0058, the flip is again a 0.20/0.20 tie in the
+    meaningless record 9.
+
+**Lesson for restarts.** A graceful shutdown can hang on "Waiting for connections to close" when a
+client keeps a streaming request open after the engine is gone. A second signal did not help; the
+API server had to be killed. The GPUs were already free at that point.
+
 ## Known effects and hazards
 
 * **Decode numerics depend on GPU memory layout.** With MTP speculation, any change in the memory

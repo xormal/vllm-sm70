@@ -2,7 +2,7 @@
 
 The runtime is configured with environment variables ("levers"). They are read by the vLLM code
 under `vllm/` and the integration layer under `sm70/integrations/vllm_sm70/`. The production set,
-98 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
+101 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
 This page explains the ones that change the computation or the memory layout. All values below are the
 production values. Every default was chosen by measurement on 2× V100 32 GB, and the code next to each
 lever carries the measurement that justified it (search the name under `vllm/` and `sm70/`).
@@ -66,6 +66,7 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_CG` | `1` | Full CUDA graph for decode (+20% decode on short contexts) |
 | `FA2SM70_MODE` | `dialog` | Group sizing tuned for interactive traffic |
 | `FA2SM70_THINK` | `false` | Default `enable_thinking` of the chat template (per-request override allowed) |
+| `FA2SM70_MM_DRAFT_SHIFT` | `1` | Schedule an image's encoder when the MTP drafter's window (one position ahead of the target's) reaches it; without it a prefill chunk ending exactly at an image's first token crashes the engine (`Encoder cache miss`). Also lets the drafter skip a missing encoder output instead of asserting. See VALIDATION.md, 2026-10-13 |
 
 ## Clef
 

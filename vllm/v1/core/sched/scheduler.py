@@ -59,6 +59,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# [FA2/SM70 13.10] Окно черновика (eagle/MTP) сдвинуто на shift_computed_tokens (=1). Проверка «есть ли в
+# окне эмбеддинги картинки» считала конец окна БЕЗ сдвига: если чанк префилла кончается ровно на первом
+# токене картинки, энкодер не планировался, а черновик читал этот токен -> `Encoder cache miss` (assert)
+# -> EngineDeadError. Боевой упал так 13.10 в 14:42 под потоком записей Clef с картинками. Рычаг -- потому
+# что venv общий; боевой пускач его включает.
+import os as _os
+_MM_DRAFT_SHIFT = _os.environ.get("FA2SM70_MM_DRAFT_SHIFT", "0") == "1"
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -1166,7 +1174,9 @@ class Scheduler(SchedulerInterface):
             # of scheduled encoder placeholder tokens.
             start_idx_rel = max(0, num_computed_tokens - start_pos)
             end_idx_rel = min(
-                num_encoder_tokens, num_computed_tokens + num_new_tokens - start_pos
+                num_encoder_tokens,
+                num_computed_tokens + num_new_tokens
+                + (shift_computed_tokens if _MM_DRAFT_SHIFT else 0) - start_pos,
             )
             curr_embeds_start, curr_embeds_end = (
                 mm_feature.mm_position.get_embeds_indices_in_range(
