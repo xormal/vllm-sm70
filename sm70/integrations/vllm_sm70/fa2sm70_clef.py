@@ -174,7 +174,8 @@ def _настроить(runner):
     else:
         deabl = os.path.join(каталог, _DEABL) if _DEABL else None
         sob = clef_sborka.sobrat(os.path.join(каталог, "clef_lora_r256_fp16.safetensors"), deabl, rank, tp,
-                                 layer_types=lt, key_dim=kd, value_dim=vd)
+                                 layer_types=lt, key_dim=kd, value_dim=vd,
+                                 num_kv_heads=cfg.num_key_value_heads)
     max_rows = int(runner.scheduler_config.max_num_batched_tokens)
     clef_sborka.ustanovit(ext, sob, nslot=_NSLOT, max_rows=min(max_rows, 4096))
     ожидаемые = {}

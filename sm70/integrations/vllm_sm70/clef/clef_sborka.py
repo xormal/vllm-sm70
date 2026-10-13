@@ -61,6 +61,19 @@ def half_rows(t, r, tp):
     return t[r * n:(r + 1) * n]
 
 
+def kv_rows(t, r, tp, n_kv):
+    """строки K или V ранга r. При tp <= n_kv -- срез голов, как half_rows. При tp > n_kv vLLM
+    ПОВТОРЯЕТ голову на tp // n_kv рангах (QKVParallelLinear: num_kv_head_replicas,
+    shard_rank = tp_rank // num_kv_head_replicas), и срез 1/tp дал бы полголовы -- со сдвигом
+    столбцов, который проверка ширины не ловит. У Qwen3.8-27B n_kv = 4: это TP=8."""
+    if not n_kv or tp <= n_kv:
+        return half_rows(t, r, tp)
+    assert tp % n_kv == 0 and t.shape[0] % n_kv == 0, (tp, n_kv, t.shape)
+    hd = t.shape[0] // n_kv
+    h = r // (tp // n_kv)
+    return t[h * hd:(h + 1) * hd]
+
+
 def half_cols(t, r, tp):
     n = t.shape[1] // tp
     return t[:, r * n:(r + 1) * n]
@@ -88,10 +101,11 @@ class Src:
 
 
 def sobrat(clef_path, deabl_path, rank, tp=2, stream_from=40, sloi=None, layer_types=None,
-           key_dim=2048, value_dim=6144):
+           key_dim=2048, value_dim=6144, num_kv_heads=None):
     """-> [(model_layer, streamed, host uint8, ops int64 [P,6])] для ранга rank.
 
-    key_dim = linear_num_key_heads * linear_key_head_dim (16*128), value_dim = 48*128 у Qwen3.8-27B."""
+    key_dim = linear_num_key_heads * linear_key_head_dim (16*128), value_dim = 48*128 у Qwen3.8-27B;
+    num_kv_heads -- KV-головы полного внимания (4): нужны, когда tp больше их числа (см. kv_rows)."""
     clef, deabl = Src(clef_path), Src(deabl_path)
     vse = set()
     for k in clef.keys | deabl.keys:
@@ -119,8 +133,8 @@ def sobrat(clef_path, deabl_path, rank, tp=2, stream_from=40, sloi=None, layer_t
                 if any(x is None for x in qkv):
                     raise RuntimeError(f"слой {L}: LoRA только на части q/k/v -- раскладка столбцов не выводится")
                 col = 0
-                for A, B in qkv:
-                    Bl = half_rows(B, rank, tp)
+                for i, (A, B) in enumerate(qkv):
+                    Bl = half_rows(B, rank, tp) if i == 0 else kv_rows(B, rank, tp, num_kv_heads)
                     bl.shrink(MOD["qkv"], A)
                     bl.expand(MOD["qkv"], Bl, col)
                     col += Bl.shape[0]

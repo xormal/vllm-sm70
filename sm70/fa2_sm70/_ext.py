@@ -75,8 +75,14 @@ def _preflight():
         raise RuntimeError("fa2_sm70: this torch has no CUDA (torch.version.cuda is None). Install a "
                            "CUDA (cu12x) build of torch.\n" + _RECIPE)
     if not torch.cuda.is_available():
-        raise RuntimeError("fa2_sm70: torch.cuda.is_available() is False (no GPU visible). Check "
-                           "CUDA_VISIBLE_DEVICES / driver.\n" + _RECIPE)
+        # FA2SM70_PREBUILD=1: compile without a GPU (docker build). The kernels are compiled for
+        # TORCH_CUDA_ARCH_LIST=7.0 and link only libcudart, which loads the driver lazily, so building
+        # and importing them needs no device; nothing queries the device until a kernel is launched.
+        if os.environ.get("FA2SM70_PREBUILD") != "1":
+            raise RuntimeError("fa2_sm70: torch.cuda.is_available() is False (no GPU visible). Check "
+                               "CUDA_VISIBLE_DEVICES / driver.\n" + _RECIPE)
+        if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
+            raise RuntimeError("fa2_sm70: FA2SM70_PREBUILD=1 needs TORCH_CUDA_ARCH_LIST=7.0 in the environment")
 
     # 2. Device arch: the kernels are tuned for sm_70; newer archs compile but are off-target.
     try:

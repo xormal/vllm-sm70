@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.10-labs
+# vllm-sm70: Qwen3.8-27B-ABLITERATED GPTQ-Int8 + Clef (/v1/systemone) on NVIDIA V100 (sm_70).
+# One image for every supported layout: 2, 4 or 8 cards, 16 or 32 GB, NVLink, PCIe or mixed.
+#
+#   docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .            # ~1.5 h, no GPU needed
+#   scripts/plan_gpus.py --out deploy/ && cd deploy && MODEL_DIR=/models/... docker compose up -d
+#
+# The model is NOT in the image: mount the Hugging Face release at /models/model (read-only).
+# Everything the server derives at run time (12-bit weight cache, torch.compile cache, Triton cache)
+# goes to /state: keep it on a volume, one per replica. docs/sm70/DOCKER.md has the details.
+#
+# CUDA is pinned to 12.8: CUDA 13 removed Volta. The host needs an NVIDIA driver >= 570.
+# Pinned by digest (resolved 2026-10-13); override with --build-arg CUDA_IMAGE=... to move.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+FROM ${CUDA_IMAGE}
+
+ARG MAX_JOBS=8
+ARG VLLM_VERSION_OVERRIDE=0.0.3+sm70
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    CUDA_HOME=/usr/local/cuda \
+    CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ \
+    TORCH_CUDA_ARCH_LIST=7.0 \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev build-essential git ca-certificates curl tini iproute2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m venv /opt/venv
+
+# 1. The pinned Python environment of the reference deployment (torch 2.9.1+cu128 and the rest).
+COPY requirements-sm70.txt /opt/vllm-sm70/requirements-sm70.txt
+RUN pip install --upgrade pip && pip install -r /opt/vllm-sm70/requirements-sm70.txt
+
+# 2. vLLM (1Cat-vLLM with the sm70 runtime) and flash-attention-v100, built for sm_70 from this
+#    repository -- the same steps as scripts/install_from_source.sh. The sm70/ tree, scripts and docs come
+#    later so that editing them does not rebuild vLLM (about an hour); pyproject.toml only needs a README
+#    to exist, the real ones are copied at the end.
+COPY --exclude=sm70 --exclude=scripts --exclude=configs --exclude=docs --exclude=docker --exclude=*.md \
+     . /opt/vllm-sm70
+WORKDIR /opt/vllm-sm70
+RUN printf '# vllm-sm70\n' > README.md \
+    && MAX_JOBS=${MAX_JOBS} NVCC_THREADS=1 pip install --no-build-isolation --no-deps ./flash-attention-v100 \
+    && MAX_JOBS=${MAX_JOBS} NVCC_THREADS=1 VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE} \
+       pip install --no-build-isolation --no-deps -e . \
+    && rm -rf build .deps/*-build .deps/*-subbuild
+
+# 3. The fa2_sm70 kernels, compiled ahead of time without a GPU (FA2SM70_PREBUILD=1). The build directory
+#    lives in the image, not in /state, so a new volume does not trigger a 20-minute JIT build. torch
+#    re-runs ninja on load, so the directory must stay writable by the runtime user.
+COPY sm70 /opt/vllm-sm70/sm70
+ENV FA2SM70_PATH=/opt/vllm-sm70/sm70 \
+    PYTHONPATH=/opt/vllm-sm70/sm70/integrations/vllm_sm70:/opt/vllm-sm70/sm70 \
+    FA2SM70_BUILD_DIR=/opt/vllm-sm70/build
+RUN FA2SM70_PREBUILD=1 python -m fa2_sm70.prebuild
+
+# 4. Launcher, lever files, profiles, planner, container helpers, docs.
+COPY scripts /opt/vllm-sm70/scripts
+COPY configs /opt/vllm-sm70/configs
+COPY docs /opt/vllm-sm70/docs
+COPY docker /opt/vllm-sm70/docker
+COPY *.md /opt/vllm-sm70/
+RUN python -m compileall -q -j 0 /opt/vllm-sm70/vllm /opt/vllm-sm70/sm70 >/dev/null; python - <<'EOF'
+import torch, vllm, flash_attn_v100_cuda  # noqa: F401
+print(f"vllm {vllm.__version__}, torch {torch.__version__} (CUDA {torch.version.cuda})")
+EOF
+
+RUN useradd --uid 10001 --create-home --shell /bin/bash sm70 \
+    && mkdir -p /state /models \
+    && chown -R sm70:sm70 /state /opt/vllm-sm70/build \
+    && chmod +x /opt/vllm-sm70/docker/*.sh /opt/vllm-sm70/scripts/*.sh /opt/vllm-sm70/scripts/plan_gpus.py
+USER sm70
+ENV SM70_IN_CONTAINER=1 \
+    PY=/opt/venv/bin/python \
+    MODEL_DIR=/models/model \
+    STATE_DIR=/state \
+    TRITON_CACHE_DIR=/state/triton \
+    HOST=0.0.0.0 \
+    PORT=8000
+VOLUME ["/state"]
+EXPOSE 8000
+
+# Ready = the server has ANSWERED a chat request (and a Clef record): /health turns 200 earlier, while
+# the first requests may still compile. First start: weights, 12-bit cache, compile, graph capture.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=3600s --retries=3 \
+    CMD /opt/vllm-sm70/docker/sm70-healthcheck.sh
+
+LABEL org.opencontainers.image.title="vllm-sm70" \
+      org.opencontainers.image.description="Qwen3.8-27B GPTQ-Int8 + Clef on NVIDIA V100 (sm_70)" \
+      org.opencontainers.image.source="https://github.com/xormal/vllm-sm70" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT"
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/vllm-sm70/docker/sm70-entrypoint.sh"]
+CMD ["serve"]

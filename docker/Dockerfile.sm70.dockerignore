@@ -1,0 +1,12 @@
+# Build context for docker/Dockerfile.sm70 (BuildKit reads <Dockerfile>.dockerignore next to it)
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+build
+dist
+.deps
+*.egg-info
+vllm/*.so
+deploy

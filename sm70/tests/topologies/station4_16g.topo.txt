@@ -1,0 +1,11 @@
+	GPU0	GPU1	GPU2	GPU3	CPU Affinity	NUMA Affinity
+GPU0	 X 	NV2	NV2	NV2	0-19	0
+GPU1	NV2	 X 	NV2	NV2	0-19	0
+GPU2	NV2	NV2	 X 	NV2	0-19	0
+GPU3	NV2	NV2	NV2	 X 	0-19	0
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes
+  NV#  = Connection traversing a bonded set of # NVLinks

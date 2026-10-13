@@ -99,7 +99,9 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 | Переменная | По умолчанию | |
 |---|---|---|
 | `MODEL_DIR` | обязательна | каталог модели; адаптеры Clef берутся из `MODEL_DIR/clef` |
-| `CARDS` | `0,1` | две карты (номера nvidia-smi) |
+| `CARDS` | `0,1` | 2, 4 или 8 карт: номера nvidia-smi или UUID `GPU-…`; тензорный разрез по всем |
+| `PROFILE`, `MAX_MODEL_LEN` | по картам | профиль памяти из [`configs/profiles/`](configs/profiles/README.md) (`tp<N>-<16g\|32g>`), предел контекста |
+| `ALLOWED_MEDIA_DOMAINS`, `VLLM_API_KEY` | не заданы | откуда разрешено скачивать картинки; токен, который требует API |
 | `HOST`, `PORT` | `0.0.0.0`, `8000` | адрес сервера |
 | `SERVED_NAMES` | `Qwen3.8-27B-ABLITERATED` | имена модели в API |
 | `THINK` | `false` | `enable_thinking` по умолчанию (можно менять в запросе) |
@@ -139,6 +141,21 @@ int8-ядра GEMM добавляют две поправки:
 родном CUDA. У запросов Clef свой `cache_salt`, и префикс-кэш они не читают. Код:
 [`sm70/integrations/vllm_sm70/fa2sm70_clef.py`](sm70/integrations/vllm_sm70/fa2sm70_clef.py),
 [`sm70/fa2_sm70/csrc/clef.cu`](sm70/fa2_sm70/csrc/clef.cu).
+
+## Docker
+
+Один образ на 2, 4 или 8 карт V100, 16 или 32 ГБ, с NVLink, без него или частично. Планировщик делит
+разрешённые карты на группы по топологии и пишет compose-файл: по реплике на группу, карты закреплены
+по UUID, впереди nginx.
+
+```bash
+docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~1.5 ч, GPU не нужен
+scripts/plan_gpus.py --gpus 0,1,2,3 --out deploy/                      # или все карты / GPU-UUID / --single
+cd deploy && MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef docker compose up -d
+```
+
+Правила группировки, профили памяти (проверен только `tp2-32g`, остальные экспериментальные до
+калибровки), состояние проверок и защита — в [docs/sm70/DOCKER.md](docs/sm70/DOCKER.md).
 
 ## Устройство репозитория и изменения относительно 1Cat-vLLM
 

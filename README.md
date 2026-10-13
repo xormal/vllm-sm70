@@ -60,7 +60,9 @@ Details, tools and known effects: [docs/sm70/VALIDATION.md](docs/sm70/VALIDATION
 ## Requirements
 
 * 2× NVIDIA V100 32 GB (tested: one NVLink pair and one PCIe pair), driver supporting CUDA 12.8 (tested 580).
-  The two GPUs must be **dedicated** to the server: the memory plan is fixed (`--kv-cache-memory-bytes`,
+  4 or 8 cards and 16 GB cards run with the memory profiles in [`configs/profiles/`](configs/profiles/README.md)
+  (experimental until calibrated); [Docker](#docker) splits larger hosts into replicas.
+  The GPUs must be **dedicated** to the server: the memory plan is fixed (`--kv-cache-memory-bytes`,
   `--gpu-memory-utilization 0.96`), so another process allocating GPU memory while the server starts makes the
   start fail with an out-of-memory error.
 * CUDA **12.8** toolkit (`nvcc`) and a host gcc it accepts (tested gcc 11.4). The sm70 kernels are JIT-compiled.
@@ -111,7 +113,9 @@ start compiles the kernels (15–30 min) and repacks the attention weights to W1
 | Variable | Default | |
 |---|---|---|
 | `MODEL_DIR` | required | checkpoint directory; Clef adapters are read from `MODEL_DIR/clef` |
-| `CARDS` | `0,1` | the two GPUs (nvidia-smi indices) |
+| `CARDS` | `0,1` | 2, 4 or 8 GPUs, nvidia-smi indices or `GPU-` UUIDs; tensor parallel over all of them |
+| `PROFILE`, `MAX_MODEL_LEN` | from cards | memory profile in [`configs/profiles/`](configs/profiles/README.md) (`tp<N>-<16g\|32g>`), context limit |
+| `ALLOWED_MEDIA_DOMAINS`, `VLLM_API_KEY` | unset | hosts images may be fetched from; bearer token required by the API |
 | `HOST`, `PORT` | `0.0.0.0`, `8000` | listen address |
 | `SERVED_NAMES` | `Qwen3.8-27B-ABLITERATED` | model names in the API |
 | `THINK` | `false` | default `enable_thinking` (per-request override allowed) |
@@ -183,6 +187,19 @@ curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '
   states are tapped into Clef's joint schema head, a native CUDA implementation. Clef requests use their
   own `cache_salt` and never read the prefix cache. Code: [`sm70/integrations/vllm_sm70/fa2sm70_clef.py`](sm70/integrations/vllm_sm70/fa2sm70_clef.py),
   [`sm70/fa2_sm70/csrc/clef.cu`](sm70/fa2_sm70/csrc/clef.cu).
+
+## Docker
+
+One image for 2, 4 or 8 V100 cards, 16 or 32 GB, NVLink, PCIe or mixed. A planner groups the allowed cards
+by topology and writes a compose file with one replica per group, pinned by GPU UUID, behind nginx:
+
+```bash
+docker build -f docker/Dockerfile.sm70 -t vllm-sm70:latest .          # ~1.5 h, no GPU needed
+scripts/plan_gpus.py --gpus 0,1,2,3 --out deploy/                      # or all cards / GPU-UUIDs / --single
+cd deploy && MODEL_DIR=/models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef docker compose up -d
+```
+
+Details, grouping rules, the validation status of each layout and hardening: [docs/sm70/DOCKER.md](docs/sm70/DOCKER.md).
 
 ## Configuration
 
