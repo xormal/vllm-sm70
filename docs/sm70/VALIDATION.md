@@ -15,6 +15,23 @@ python $P kartinki 8000 img.json clef   # 8 requests x 2 images (1280x960 + 640x
 python $P igla    8000 245000 n.json    # code word at the START of a ~245K-token prompt
 python $P dlinnye 8000 long.json 32768  # Clef length test: facts with known answers at 5/50/95 %
                                         # of 4K/12K/24K/31K-token records (needs FA2SM70_CLEF_NMAX=32768)
+python $P clefkart 8000 img.json        # Clef with images: 15 records with known answers (color, digit,
+                                        # shape, word, the second of two images, image + ~11K tokens of
+                                        # text), a repeat for determinism, and refusals (video, bad URL,
+                                        # "images" not a list); needs FA2SM70_CLEF_MEDIA=1
+```
+
+Offline gate for the image path of `/v1/systemone` (CPU, no server): the record built by the endpoint
+must equal Clef's own `encode_record`, token for token and span for span, and vLLM's multimodal processor
+must expand the collapsed record the endpoint sends into exactly that record. It runs the endpoint's real
+chain (`_url` → vLLM media connector → token count → record → vLLM expansion), because the parts can pass
+separately while the chain fails (see 2026-10-13 below). Pass a COPY of the directory with Clef's
+`joint_schema_model.py`:
+
+```bash
+python -I sm70/integrations/vllm_sm70/clef/sverka_media_offline.py \
+    sm70/integrations/vllm_sm70 /path/to/copy-of-clef /models/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef
+# expected last line: ИТОГ: СОШЛОСЬ ("matched")
 ```
 
 `clefsr` against a reference run requires a server on the original Clef weights: serve
@@ -37,6 +54,27 @@ configuration (MTP k=3, fp16 all-reduce).
 | Clef memory | +290 MiB on rank 0, +121 MiB on rank 1 |
 | **Fresh clone of this repository, built from source in a new virtualenv, serving the Hugging Face release** (2026-10-12, PCIe pair) | base outputs **bitwise identical** to the stand runs in production configuration; Clef max \|Δp\| 0.0000 vs those runs and 0.0093 (35/35) vs Cloudflare/clef fp16; images 8/8, mixed load 16/16, 243,173-token needle found; ≥ 660 MiB free at peak |
 | Base model with Clef enabled vs disabled | first token bitwise identical; decode differs at ~1e-3 in logprobs (see below) |
+
+### Clef: records up to 32K and images (2026-10-13, production)
+
+`FA2SM70_CLEF_NMAX=32768`, `FA2SM70_CLEF_MEDIA=1`, NVLink pair, under live traffic.
+
+| Gate | Result |
+|---|---|
+| Offline image gate (endpoint record vs Clef `encode_record`; vLLM expansion vs endpoint record) | 3/3 records (1 image of 1,200 tokens, 2 images, text only) |
+| Clef text, 10 records, vs production of 2026-10-12 | 35/35, max \|Δp\| 0.0058 when quiet; 34/35, 0.018 under live load (the same 0.200/0.199 near-tie) |
+| `clefkart`: 15 image records with known answers | 16/16 decisions correct, p ≈ 0.99; repeat bitwise, also across two runs; video / bad URL / non-list → 400 |
+| `dlinnye`: facts at 5/50/95 % of 4K, 12K, 24K, 31K-token records + records without facts | 40/40; a full 32,768-token record takes 28 s |
+| `kartinki … clef`: 8 chat requests × 2 images + 2 Clef records | 8/8 and 2/2 |
+| 243,173-token needle | found; 228.4 s alone at 1293–1342 MHz, 78–82 °C (2026-10-12: 219.9 / 241.2 s); 303.6 s with 2–6 other requests running |
+| Clef memory | rank 0: 354 MiB (+64 MiB for 32K), rank 1: 121 MiB; ≥ 602 MiB free at the needle peak, no allocation failures |
+
+The first rollout returned 400 for every image record: vLLM's media connector returns images wrapped in
+`MediaWithBytes` (PIL image plus original bytes, used for cache hashing), and the transformers image
+processor used to count image tokens rejects the wrapper. The offline gate of that time tested the
+connector and the processor separately on plain PIL images and missed it. The endpoint now unwraps the
+image for counting only and hands the wrapper to the engine, like chat does; the offline gate runs the
+whole chain and fails on the old code with the same error.
 
 ## Known effects and hazards
 

@@ -74,7 +74,9 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_CLEF` | `1` | Enables `/v1/systemone`. `0` serves the base model with zero changes to its code path |
 | `FA2SM70_CLEF_DIR` | `<model>/clef` | Adapter directory (LoRA, de-abliteration, joint head) |
 | `FA2SM70_CLEF_R` | `2` | Concurrent Clef records (head slots) |
-| `FA2SM70_CLEF_NMAX` | `16384` | Maximum record length in tokens (head memory: 2 KiB per token per slot). The head is verified up to 32,768 |
+| `FA2SM70_CLEF_NMAX` | `32768` | Maximum record length in tokens; a request's `max_length` can only lower it. Head memory is 2 KiB per token per slot: 32,768 costs +64 MiB on rank 0 over 16,384 (Clef's own default and the code default). The head is verified against a PyTorch fp32 reference at 32,768 |
+| `FA2SM70_CLEF_MEDIA` | `1` | Accept `"images"` in Clef records. `0` (code default) rejects them with 400 |
+| `FA2SM70_CLEF_IMGMAX` | `16` | Images per Clef record |
 | `FA2SM70_CLEF_NSLOT` | `3` | Ring slots for streaming LoRA layers 40–63 from pinned host memory |
 | `FA2SM70_CLEF_OUT` | `/dev/shm/...` | Where workers leave results for the API process |
 | `FA2SM70_CLEF_NODELTA` | unset | Diagnostics: head only, no weight correction |

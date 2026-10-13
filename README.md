@@ -19,7 +19,7 @@ Model weights and Clef adapters: **[alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-C
 | **Hardware** | 2× NVIDIA V100 32 GB, tensor parallel 2, NVLink or PCIe |
 | **Context** | 262,144 tokens, int8 KV cache |
 | **Modalities** | text, images, video, tool calls (OpenAI-compatible API) |
-| **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, +0.29 / +0.12 GB of GPU memory |
+| **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, records up to 32,768 tokens with images, +0.35 / +0.12 GB of GPU memory |
 | **Speculation** | native MTP head, k = 3, with n-gram assist |
 
 ---
@@ -52,6 +52,7 @@ with its own kernels and integration:
 | Decode, single stream | 55.8 / 58.4 / 48.6 tok/s at 32K / 128K / 250K on filler, 63.8 tok/s on natural text (MTP k=3) |
 | Long-context retrieval | code word at the start of a 243,173-token prompt reproduced verbatim (2026-10-12) |
 | Clef vs the original Clef in fp16 | 35/35 decisions, max \|Δp\| 0.0093 on 10 records of 152–16,384 tokens |
+| Clef with images and long records (2026-10-13, production) | 16/16 known-answer image records (color, digit, shape, word, order of two images, image + 11K tokens of text), repeat bitwise; facts at 5/50/95 % of 4K–32K-token records 40/40 |
 | Load | 10 Clef records + 6 chats concurrently, and 8 × 2-image storms followed by a 243K prompt: no failures |
 
 Details, tools and known effects: [docs/sm70/VALIDATION.md](docs/sm70/VALIDATION.md).
@@ -115,6 +116,7 @@ start compiles the kernels (15–30 min) and repacks the attention weights to W1
 | `SERVED_NAMES` | `Qwen3.8-27B-ABLITERATED` | model names in the API |
 | `THINK` | `false` | default `enable_thinking` (per-request override allowed) |
 | `FA2SM70_CLEF` | `1` | `0` serves the base model only |
+| `FA2SM70_CLEF_NMAX`, `FA2SM70_CLEF_MEDIA` | `32768`, `1` | Clef record limit in tokens; images in Clef records (`0` rejects them) |
 | `STATE_DIR`, `PY`, `CUDA_HOME` | see script | cache directory, Python, toolkit |
 | `DRYRUN=1` | | print the resolved environment and command without starting |
 
@@ -143,6 +145,16 @@ curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '
     "outage":     {"type": "noul", "instructions": "Is a service down?"}}}'
 ```
 
+With images (`"images"`: http(s) URLs, data URLs, bare base64 or chat-style `{"image_url": {"url": ...}}`):
+
+```bash
+curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "clef",
+  "state": {"task": "Triage the attached screenshot."},
+  "images": ["https://example.com/screenshot.png"],
+  "questions": {"error": {"type": "noul", "instructions": "Does the screenshot show an error message?"}}}'
+```
+
 ```json
 {"model": "clef", "answers": {
   "department": {"type": "choice", "choice": "technical", "confidence": 0.9185,
@@ -156,9 +168,15 @@ curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '
 
 * **Question types:** `choice` (dict of options → `choice`, `probabilities`), `score` (ordered list →
   expected `score`, `probabilities`), `noul` (→ probability of "yes"). `state` is a string or any JSON value.
-* **Limits:** 16,384 tokens per record (Clef's own default `max_length`; lower it per request with
-  `"max_length"`), 64 questions, 448 options in total, 256 options per question. Two records are processed
-  concurrently and further ones wait.
+* **Limits:** 32,768 tokens per record, images included (`FA2SM70_CLEF_NMAX`; Clef's own default
+  `max_length` is 16,384, lower it per request with `"max_length"`), up to 16 images per record, 64
+  questions, 448 options in total, 256 options per question. Videos are rejected with 400. Two records are
+  processed concurrently and further ones wait.
+* **Images** are encoded as in Clef's `encode_record`: the image tokens follow `STATE:\n`. Clef's vision
+  encoder is bitwise identical to this checkpoint's (333/333 tensors), so the served encoder is reused as is.
+  Images are fetched like in chat (same media connector, same domain and path restrictions). The worker
+  checks that the record the engine received (length and checksum) equals the one the endpoint encoded
+  and refuses the request otherwise.
 * **How it works.** The record is encoded with Clef's template and runs as a one-token prefill. For its
   rows only, the int8 GEMM kernels add `deabl` (rank 1, layers 2–63) and Clef's exact rank-256 LoRA (layers
   40–63, streamed from pinned host memory), which turns the served weights into Clef's. The final hidden
@@ -222,8 +240,13 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
   clients.
 * With speculation, decode logprobs depend at the ~1e-3 level on the GPU memory layout at startup
   (see VALIDATION.md). Bitwise comparisons are only meaningful between identical configurations.
-* Clef records are limited to 16,384 tokens by default. The native head is verified to 32,768, but Clef's
-  behavior beyond 16K was not evaluated.
+* Clef records go up to 32,768 tokens. The native head is verified against PyTorch fp32 at 32,768 and a
+  fact-retrieval test passes 40/40 up to 32K, but Cloudflare did not evaluate Clef beyond its own 16,384
+  default.
+* Clef with images is checked on known-answer records and for determinism, not yet against the original
+  Clef's probabilities. This checkpoint ships the fast Qwen2-VL image processor while Clef uses the slow
+  one: image token counts are identical, pixel values may differ slightly. Videos are not supported in
+  `/v1/systemone`.
 
 ## License
 

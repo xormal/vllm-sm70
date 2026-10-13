@@ -12,6 +12,14 @@
                                             max_tokens=1) -- контроль: держит ли её сама база
     kartinki <порт> <выход.json|-> [clef]   штурм картинками: 8 запросов по 2 картинки (1280x960 + 640x480)
                                             разом; с «clef» -- параллельно 2 записи Clef (ответы в выход)
+    dlinnye <порт> <выход.json> [max_length] ДЕТЕРМИНИРОВАННЫЙ тест длины для Clef: факты с известным
+                                            ответом (город -- выбор из 4, пароль -- да/нет, цвет -- выбор
+                                            из 4) на 5/50/95 % записи длиной 4K/12K/24K/31K + запись без
+                                            фактов на каждую длину (ложное «да»); max_length по умолчанию 32768
+    clefkart <порт> <выход.json>           Clef С КАРТИНКАМИ (FA2SM70_CLEF_MEDIA=1): записи с известным ответом
+                                            (цвет, цифра, фигура, слово, порядок двух картинок, картинка +
+                                            длинное состояние), повтор на детерминизм, отказы (видео, плохой
+                                            URL, без картинок -- как прежде)
     igla   <порт> <токенов> [выход.json]    кодовое слово в САМОМ НАЧАЛЕ длинного контекста (гейт
                                             поведения боевого: «первый токен верный, дальше мусор»)
                                             + короткий осмысленный ответ; худший случай по памяти
@@ -261,6 +269,176 @@ def kartinki(port, out, s_clef=False):
                   ensure_ascii=False, indent=1)
 
 
+def _картинка(вид, знач, w=448, h=448):
+    """синтетическая картинка с однозначным ответом -> data-URL PNG"""
+    import base64, io
+    from PIL import Image, ImageDraw, ImageFont
+    цв = {"red": (220, 30, 30), "green": (30, 170, 60), "blue": (30, 60, 220), "yellow": (240, 220, 30),
+          "black": (0, 0, 0), "white": (255, 255, 255)}
+    im = Image.new("RGB", (w, h), цв["white"])
+    d = ImageDraw.Draw(im)
+    def шрифт(n):
+        # замеры 13.10 -- на DejaVuSans-Bold; без него крупный встроенный шрифт Pillow (>= 10.1)
+        for f in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVuSans-Bold.ttf"):
+            try:
+                return ImageFont.truetype(f, n)
+            except OSError:
+                pass
+        return ImageFont.load_default(size=n)
+    if вид == "цвет":
+        im = Image.new("RGB", (w, h), цв[знач])
+    elif вид == "цифра":
+        d.text((w // 2, h // 2), знач, fill=(0, 0, 0), font=шрифт(int(h * 0.7)), anchor="mm")
+    elif вид == "фигура":
+        m = w // 6
+        if знач == "circle":
+            d.ellipse((m, m, w - m, h - m), fill=цв["blue"])
+        elif знач == "square":
+            d.rectangle((m, m, w - m, h - m), fill=цв["blue"])
+        else:
+            d.polygon([(w // 2, m), (w - m, h - m), (m, h - m)], fill=цв["blue"])
+    elif вид == "слово":
+        d.text((w // 2, h // 2), знач, fill=цв["red"], font=шрифт(int(h * 0.25)), anchor="mm")
+    b = io.BytesIO()
+    im.save(b, "PNG")
+    return "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
+
+
+def записи_картинки():
+    """(запись, ожидание): ожидание = {вопрос: верный вариант} (для noul -- True/False)"""
+    R = []
+    цвета = {c: f"The image is {c}" for c in ("red", "green", "blue", "yellow")}
+    for c in цвета:
+        R.append(({"model": "clef", "state": {"task": "Classify the attached image."}, "images": [_картинка("цвет", c)],
+                   "questions": {"color": {"type": "choice", "instructions": "What is the color of the image?",
+                                           "criteria": цвета}}}, {"color": c}))
+    цифры = {x: f"The digit {x}" for x in ("2", "4", "7", "9")}
+    for x in цифры:
+        R.append(({"model": "clef", "state": "A scanned form field.", "images": [_картинка("цифра", x)],
+                   "questions": {"digit": {"type": "choice", "instructions": "Which digit is written in the image?",
+                                           "criteria": цифры}}}, {"digit": x}))
+    фигуры = {f: f"A {f}" for f in ("circle", "square", "triangle")}
+    for f in фигуры:
+        R.append(({"model": "clef", "state": "Shape inspection.", "images": [_картинка("фигура", f)],
+                   "questions": {"shape": {"type": "choice", "instructions": "What shape is drawn in the image?",
+                                           "criteria": фигуры}}}, {"shape": f}))
+    for слово, да in (("STOP", True), ("OPEN", False)):
+        R.append(({"model": "clef", "state": "Road sign photo.", "images": [_картинка("слово", слово)],
+                   "questions": {"stop": {"type": "noul", "instructions": "Does the image contain the word STOP?"}}},
+                  {"stop": да}))
+    # порядок двух картинок: вопрос о ВТОРОЙ
+    R.append(({"model": "clef", "state": "Two photos are attached, in order.",
+               "images": [_картинка("цвет", "red"), _картинка("цвет", "blue")],
+               "questions": {"second": {"type": "choice", "instructions": "What is the color of the second image?",
+                                        "criteria": цвета}}}, {"second": "blue"}))
+    # картинка + длинное состояние: спаны схемы сдвинуты и картинкой, и текстом
+    R.append(({"model": "clef", "state": текст_доков(30000, 5000) + "\n\nThe ticket is about the attached picture.",
+               "images": [_картинка("цифра", "7")],
+               "questions": {"digit": {"type": "choice", "instructions": "Which digit is written in the attached image?",
+                                       "criteria": цифры},
+                             "kernels": {"type": "noul", "instructions": "Is the text about GPU kernels or GPU programming?"}}},
+              {"digit": "7", "kernels": True}))
+    return R
+
+
+def clefkart(port, out):
+    рез, верно, всего = [], 0, 0
+    for i, (r, ожид) in enumerate(записи_картинки()):
+        d, t = post(port, "/v1/systemone", r)
+        if "answers" not in d:
+            print(f"запись {i}: ОТКАЗ {str(d)[:300]}", flush=True)
+            рез.append({"i": i, "resp": d, "t": t})
+            всего += len(ожид)
+            continue
+        отв = []
+        for q, e in ожид.items():
+            a = d["answers"][q]
+            if a["type"] == "noul":
+                ok = (a["noul"] > 0.5) == e
+                отв.append(f"{q}: noul={a['noul']:.3f} {'ВЕРНО' if ok else 'НЕВЕРНО'}")
+            else:
+                ok = a["choice"] == e
+                отв.append(f"{q}: {a['choice']} p={a['probabilities'][e]:.3f} {'ВЕРНО' if ok else 'НЕВЕРНО (ждали ' + e + ')'}")
+            верно += ok
+            всего += 1
+        print(f"запись {i}: {d['usage']['input_tokens']} ток, {t:.2f} с: " + "; ".join(отв), flush=True)
+        рез.append({"i": i, "resp": d, "t": t})
+    # детерминизм: первая запись ещё раз
+    r0 = записи_картинки()[0][0]
+    d2, _ = post(port, "/v1/systemone", r0)
+    повтор = "answers" in d2 and "answers" in рез[0]["resp"] and d2["answers"] == рез[0]["resp"]["answers"]
+    # отказы
+    плохие = {"видео": dict(r0, videos=["x"]), "плохой URL": dict(r0, images=["http://127.0.0.1:9/none.png"]),
+              "не список": dict(r0, images="abc")}
+    отказы = {k: post(port, "/v1/systemone", v)[0].get("http_error") for k, v in плохие.items()}
+    print(f"ИТОГ картинки: {верно}/{всего} верно; повтор побайтово {повтор}; отказы {отказы}", flush=True)
+    json.dump(рез, open(out, "w"), ensure_ascii=False, indent=1)
+
+
+ГОРОДА = {"tbilisi": "Tbilisi", "kazan": "Kazan", "lisbon": "Lisbon", "oslo": "Oslo"}
+ЦВЕТА = ["red", "blue", "green", "black"]
+
+
+def длинные_записи(max_len=32768):
+    """детерминированно: сдвиг окна текста, город и цвет -- функции номера записи"""
+    доки = текст_доков(10 ** 8)
+    R, k = [], 0
+    for L in (4000, 12000, 24000, 31000):
+        if L > max_len - 1500:                       # место под схему вопросов
+            continue
+        for pos in (0.05, 0.5, 0.95, None):
+            город = list(ГОРОДА)[(k + k // 4) % 4]          # сдвиг по длинам: позиция != ответ
+            цвет = ЦВЕТА[(3 * k + 1 + 2 * (k // 4)) % 4]
+            nchar = int(L * 2.57)
+            off = (k * 104729) % (len(доки) - nchar)
+            тело = доки[off:off + nchar]
+            if pos is not None:
+                факт = (f"\n\nIMPORTANT NOTE. The participants' meeting is scheduled in the city of "
+                        f"{ГОРОДА[город]}. The vault password is FLAMINGO. The director's car is {цвет}.\n\n")
+                i = int(nchar * pos)
+                тело = тело[:i] + факт + тело[i:]
+            R.append({"meta": {"L": L, "pos": pos, "city": город if pos is not None else None,
+                               "car": цвет if pos is not None else None, "password": pos is not None},
+                      "record": {"model": "clef", "max_length": max_len, "state": тело, "questions": {
+                          "city": {"type": "choice", "criteria": ГОРОДА,
+                                   "instructions": "In which city is the participants' meeting scheduled?"},
+                          "password": {"type": "noul",
+                                       "instructions": "Does the text say that the vault password is FLAMINGO?"},
+                          "car": {"type": "choice", "criteria": {c: f"The car is {c}" for c in ЦВЕТА},
+                                  "instructions": "What color is the director's car?"}}}})
+            k += 1
+    return R
+
+
+def dlinnye(port, out, max_len=32768):
+    рез, по_длине = [], {}
+    for z in длинные_записи(max_len):
+        m = z["meta"]
+        d, t = post(port, "/v1/systemone", z["record"])
+        if "answers" not in d:
+            print(f"L={m['L']} pos={m['pos']}: ОТКАЗ {str(d)[:300]}", flush=True)
+            рез.append({"meta": m, "resp": d, "t": t})
+            continue
+        a = d["answers"]
+        pc, pk = a["city"]["probabilities"], a["car"]["probabilities"]
+        noul = a["password"]["noul"]
+        ok = {"password": (noul > 0.5) == m["password"]}
+        if m["pos"] is not None:
+            ok["city"] = max(pc, key=pc.get) == m["city"]
+            ok["car"] = max(pk, key=pk.get) == m["car"]
+            подр = (f"город {m['city']}: p={pc[m['city']]:.3f} {'ВЕРНО' if ok['city'] else 'НЕВЕРНО ' + max(pc, key=pc.get)}; "
+                    f"цвет {m['car']}: p={pk[m['car']]:.3f} {'ВЕРНО' if ok['car'] else 'НЕВЕРНО ' + max(pk, key=pk.get)}; ")
+        else:
+            подр = f"(без фактов) макс. p города {max(pc.values()):.3f}, цвета {max(pk.values()):.3f}; "
+        подр += f"пароль noul={noul:.3f} {'ВЕРНО' if ok['password'] else 'НЕВЕРНО'}"
+        print(f"L={m['L']:>5} ({d['usage']['input_tokens']} ток, {t:.1f} с) pos={str(m['pos']):>4}: {подр}", flush=True)
+        s = по_длине.setdefault(m["L"], [0, 0])
+        s[0] += sum(ok.values()); s[1] += len(ok)
+        рез.append({"meta": m, "resp": d, "t": t, "ok": ok})
+    json.dump(рез, open(out, "w"), ensure_ascii=False, indent=1)
+    print("ИТОГ по длинам: " + "; ".join(f"{L}: {a}/{b}" for L, (a, b) in sorted(по_длине.items())), flush=True)
+
+
 def igla(port, токенов, out=None):
     import re
     # ~2.6 символа на токен в смеси ru/en документов; длину уточняем по числу, которое назвал сервер
@@ -308,6 +486,10 @@ if __name__ == "__main__":
         smes(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 1)
     elif cmd == "kartinki":
         kartinki(int(sys.argv[2]), sys.argv[3], len(sys.argv) > 4 and sys.argv[4] == "clef")
+    elif cmd == "clefkart":
+        clefkart(int(sys.argv[2]), sys.argv[3])
+    elif cmd == "dlinnye":
+        dlinnye(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 32768)
     elif cmd == "igla":
         igla(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] if len(sys.argv) > 4 else None)
     elif cmd == "smesb":

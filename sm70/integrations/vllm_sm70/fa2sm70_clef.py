@@ -28,7 +28,21 @@
 #   FA2SM70_CLEF_NSLOT             ячеек кольца подкачки (3)
 #   FA2SM70_CLEF_R                 одновременных запросов Clef (2)
 #   FA2SM70_CLEF_OUT               куда класть результаты (/dev/shm/fa2sm70_clef)
+#   FA2SM70_CLEF_NMAX              предел длины записи в токенах (16384; голова сверена до 32768)
+#   FA2SM70_CLEF_MEDIA=1           картинки в записи ("images"), как у Clef; умолчание 0 = отказ 400
+#   FA2SM70_CLEF_IMGMAX            картинок на запись (16)
+#
+# КАРТИНКИ (13.10). Визуальный энкодер Clef ПОБАЙТОВО равен энкодеру боевой сети (333/333 тензора),
+# поэтому новых весов нет: энкодер считает vLLM (до _model_forward, поправка его не касается), а
+# поправка Clef ложится на все строки записи, включая строки картинок. Токены картинок стоят сразу
+# после "STATE:\n", как в encode_record Clef. Движку уходят СВЁРНУТЫЕ заполнители (по одному
+# <|image_pad|> на картинку) -- vLLM разворачивает их сам; спаны считаются по РАЗВЁРНУТОЙ записи
+# (число токенов картинки -- тем же процессором изображений). Воркер сверяет длину и контрольную
+# сумму записи в движке с тем, что посчитал эндпоинт, и при расхождении отказывает, а не считает
+# по сдвинутым спанам.
 import json
+import zlib
+from array import array
 import math
 import os
 import re
@@ -44,6 +58,9 @@ _NSLOT = int(os.environ.get("FA2SM70_CLEF_NSLOT", "3"))
 _R = int(os.environ.get("FA2SM70_CLEF_R", "2"))
 _OUT = os.environ.get("FA2SM70_CLEF_OUT", "/dev/shm/fa2sm70_clef")
 _NMAX = int(os.environ.get("FA2SM70_CLEF_NMAX", "16384"))
+_MEDIA = os.environ.get("FA2SM70_CLEF_MEDIA", "0") == "1"
+_IMGMAX = int(os.environ.get("FA2SM70_CLEF_IMGMAX", "16"))
+IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 # диагностика (12.10): in_proj_ba остаётся штатным (своя операция не ставится, поправка ba не действует)
 _БЕЗ_BA = os.environ.get("FA2SM70_CLEF_NOBA", "0") == "1"
 # диагностика (12.10, поиск сдвига базового декода): nosetup | nohead | notrim (через запятую)
@@ -70,9 +87,15 @@ class _Состояние:
         self.free = []
         self.lm_head = None
         self.ok = False
+        self.otkaz = set()       # req_id запросов, которым отказано (до их конца)
 
 
 _С = _Состояние()
+
+
+def _сумма(ids):
+    """контрольная сумма записи: эндпоинт и воркер считают её одинаково"""
+    return zlib.crc32(array("i", ids).tobytes())
 
 _РАЗБОР = re.compile(r"(?:^|\.)layers\.(\d+)\.(self_attn\.qkv_proj|self_attn\.o_proj|linear_attn\.in_proj_qkvz|"
                      r"linear_attn\.in_proj_ba|linear_attn\.out_proj|mlp\.gate_up_proj|mlp\.down_proj)$")
@@ -251,10 +274,13 @@ class _ЧтецСловаря:
 def _приём(runner, rid, req, c):
     """новый запрос Clef: ячейка головы и её данные (ранг 0)"""
     import torch
+    N = int(req.num_prompt_tokens)
+    # сверка ДО выдачи ячейки и на ОБОИХ рангах: отказ симметричен, поправка не ляжет ни на одном
+    if "n" in c and (N != int(c["n"]) or _сумма(list(req.prompt_token_ids)) != int(c["h"])):
+        raise ValueError(f"запись в движке ({N} токенов) не равна записи эндпоинта ({c['n']})")
     if not _С.free:
         return None
     slot = _С.free.pop(0)
-    N = int(req.num_prompt_tokens)
     _С.slots[rid] = (slot, c.get("key", rid), N)
     if not _С.golova:
         return slot
@@ -293,6 +319,8 @@ def _шаг(runner, so):
             if _С.golova:
                 _С.ext.req_end(slot)
             _С.free.append(slot)
+    if _С.otkaz:
+        _С.otkaz = {r for r in _С.otkaz if r in runner.requests and r not in so.finished_req_ids}
     segs, row0 = [], 0
     ib = runner.input_batch
     for i, rid in enumerate(ib.req_ids):
@@ -302,6 +330,9 @@ def _шаг(runner, so):
         c = (sp.extra_args or {}).get("fa2sm70_clef") if sp is not None and sp.extra_args else None
         if c is not None and n > 0:
             pos0 = int(ib.num_computed_tokens_cpu[i])
+            if rid in _С.otkaz:
+                row0 += n
+                continue
             if rid not in _С.slots:
                 try:
                     if pos0 != 0:
@@ -310,6 +341,7 @@ def _шаг(runner, so):
                         raise ValueError("нет свободной ячейки головы")
                 except Exception as e:  # noqa: BLE001
                     _лог(f"отказ запросу {rid}: {e}")
+                    _С.otkaz.add(rid)
                     if _С.golova:
                         _записать(c.get("key", rid), {"error": str(e)})
                     row0 += n
@@ -423,8 +455,34 @@ def _варианты(q):
     return [(str(i), v) for i, v in enumerate(q["criteria"])]
 
 
-def закодировать(tok, record, max_length=16384):
-    """повтор encode_record из релиза Clef (только текст)"""
+def _токены_картинок(ip, imgs, mk):
+    """число токенов каждой картинки процессором изображений сети. Загрузчик vLLM отдаёт картинку в обёртке
+    MediaWithBytes (PIL + исходные байты, для хеша кэша); процессор transformers её не принимает -- снимаем
+    обёртку здесь, а движку уходит она сама, как у чата."""
+    m2 = int(ip.merge_size) ** 2
+    return [int(ip(images=[getattr(im, "media", im)], return_tensors="pt", **mk)["image_grid_thw"].prod()) // m2
+            for im in imgs]
+
+
+def _медиа_ид(tok, counts):
+    """токены картинок, как их даёт _encode_media Clef: (свёрнутые -- движку, развёрнутые -- для спанов)"""
+    base = tok(IMAGE_PLACEHOLDER * len(counts) + "\n", add_special_tokens=False).input_ids
+    pad = tok.convert_tokens_to_ids("<|image_pad|>")
+    full, i = [], 0
+    for t in base:
+        if t == pad:
+            full += [pad] * counts[i]
+            i += 1
+        else:
+            full.append(t)
+    if i != len(counts):
+        raise ValueError("image placeholder tokenization")
+    return base, full
+
+
+def закодировать(tok, record, max_length=16384, media=None):
+    """повтор encode_record из релиза Clef; media = _медиа_ид(...) или None.
+    Возвращает (запись для спанов, вопросы, запись для движка) -- без картинок обе записи равны."""
     T = lambda s: tok(s, add_special_tokens=False).input_ids  # noqa: E731
     schema = T("\n\nSCHEMA FIELDS:\n")
     qs = []
@@ -453,14 +511,16 @@ def закодировать(tok, record, max_length=16384):
     prefix = T(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n")
     suffix = T("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
     state = T(_render(record["state"]))
-    fixed = len(prefix) + len(schema) + len(suffix)
+    m_eng, m_full = media if media is not None else ([], [])
+    fixed = len(prefix) + len(m_full) + len(schema) + len(suffix)
     if fixed > max_length:
         raise ValueError(f"schema requires {fixed} tokens before state; maximum is {max_length}")
     state = state[: max_length - fixed]
-    off = len(prefix) + len(state)
-    ids = prefix + state + schema + suffix
+    off = len(prefix) + len(m_full) + len(state)
+    ids = prefix + m_full + state + schema + suffix
+    eng = prefix + m_eng + state + schema + suffix
     qs = [(qid, t, (a + off, b + off), [(s + off, e + off) for s, e in osp], oids) for qid, t, (a, b), osp, oids in qs]
-    return ids, qs
+    return ids, qs, eng
 
 
 def _ответ(q, p):
@@ -477,6 +537,19 @@ def _ответ(q, p):
             "probabilities": {l: round(p[l], 4) for l in lv}}
 
 
+def _url(x):
+    """картинка записи: строка (http(s)/data-URL или голый base64) либо {"url"} / {"image_url": ...}"""
+    if isinstance(x, dict):
+        x = x.get("image_url", x.get("url"))
+        if isinstance(x, dict):
+            x = x.get("url")
+    if not isinstance(x, str) or not x:
+        raise ValueError("each image must be a URL, a data URL or base64 string")
+    if x.startswith(("http://", "https://", "data:")):
+        return x
+    return "data:image/png;base64," + x
+
+
 def установить_сервер():
     import asyncio
     import uuid
@@ -484,6 +557,26 @@ def установить_сервер():
 
     _исх = gen.register_generate_api_routers
     _сем = [None]
+    _мед = [None, None]          # загрузчик картинок (как у чата), процессор изображений
+
+    def _загрузчик(ec):
+        if _мед[0] is None:
+            from vllm import envs
+            from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
+            mc = ec.model_config
+            _мед[0] = MEDIA_CONNECTOR_REGISTRY.load(
+                envs.VLLM_MEDIA_CONNECTOR,
+                media_io_kwargs=getattr(mc.multimodal_config, "media_io_kwargs", None),
+                allowed_local_media_path=mc.allowed_local_media_path or "",
+                allowed_media_domains=mc.allowed_media_domains)
+        return _мед[0]
+
+    def _токенов_картинки(ec, pil, mk):
+        """число токенов каждой картинки -- тем же процессором изображений, что у движка и у Clef"""
+        if _мед[1] is None:
+            from transformers import AutoImageProcessor
+            _мед[1] = AutoImageProcessor.from_pretrained(ec.model_config.model)
+        return _токены_картинок(_мед[1], pil, mk)
 
     def register_generate_api_routers(app):
         _исх(app)
@@ -501,29 +594,47 @@ def установить_сервер():
                     raise ValueError("model and state are required")
                 if not isinstance(qs, dict) or not qs:
                     raise ValueError("at least one question is required")
-                if body.get("images") or body.get("videos"):
-                    raise ValueError("images/videos are not supported by this endpoint yet")
+                if body.get("videos"):
+                    raise ValueError("videos are not supported by this endpoint yet")
+                imgs = body.get("images") or []
+                if imgs and not _MEDIA:
+                    raise ValueError("images are not supported by this endpoint")
+                if not isinstance(imgs, list) or len(imgs) > _IMGMAX:
+                    raise ValueError(f"images must be a list of at most {_IMGMAX} items")
+                mk = body.get("media_kwargs") or {}
+                if not isinstance(mk, dict):
+                    raise ValueError("media_kwargs must be an object")
                 for qid, q in qs.items():
                     if q.get("type") not in QUESTION_TYPES:
                         raise ValueError(f"{qid}: type must be noul, choice, or score")
                     if q["type"] != "noul" and not q.get("criteria"):
                         raise ValueError(f"{qid}: criteria must not be empty")
                 ec = raw.app.state.engine_client
-                ids, enc = закодировать(ec.get_tokenizer(), body, int(body.get("max_length", _NMAX)))
+                tok = ec.get_tokenizer()
+                media, pil = None, []
+                if imgs:
+                    con = _загрузчик(ec)
+                    pil = [await con.fetch_image_async(_url(x)) for x in imgs]
+                    media = _медиа_ид(tok, await asyncio.to_thread(_токенов_картинки, ec, pil, mk))
+                ids, enc, eng = закодировать(tok, body, min(int(body.get("max_length", _NMAX)), _NMAX), media)
             except Exception as e:  # noqa: BLE001
                 return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
             key = uuid.uuid4().hex
             spans = [list(q[2]) for q in enc] + [list(s) for q in enc for s in q[3]]
             extra = {"fa2sm70_clef": {"key": key, "spans": spans, "counts": [len(q[3]) for q in enc],
-                                      "types": [q[1] for q in enc]}}
+                                      "types": [q[1] for q in enc], "n": len(ids), "h": _сумма(ids)}}
+            prompt = TokensPrompt(prompt_token_ids=eng, cache_salt=_SALT)
+            if pil:
+                prompt["multi_modal_data"] = {"image": pil}
+                if mk:
+                    prompt["mm_processor_kwargs"] = mk
             sp = SamplingParams(max_tokens=1, temperature=0.0, extra_args=extra)
             sp.skip_reading_prefix_cache = True
             if _сем[0] is None:
                 _сем[0] = asyncio.Semaphore(_R)
             путь = os.path.join(_OUT, key + ".json")
             async with _сем[0]:
-                async for _ in ec.generate(TokensPrompt(prompt_token_ids=ids, cache_salt=_SALT), sp,
-                                           request_id=f"systemone-{key}"):
+                async for _ in ec.generate(prompt, sp, request_id=f"systemone-{key}"):
                     pass
                 for _ in range(200):
                     if os.path.exists(путь):
