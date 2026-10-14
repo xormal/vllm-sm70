@@ -163,6 +163,62 @@ traffic. Why it started that day is not established.
 * After the restart: chat, Clef, and an image exactly at the first chunk boundary all answered
   correctly.
 
+**Follow-up the same day: the same defect in the kernels, and a guard.**
+* An audit of every buffer reachable from a captured graph found three more that were released on
+  growth. All three are C++ `static` buffers, so `FA2SM70_KEEP_BUFS` cannot reach them:
+  * `_Eg` of `sparse_select_rows`: per-head selection with `topf > 0`, production 0.15;
+  * the split-K workspaces `кэш` and `кэш_hmma` of `w8a16_gemv`.
+* Until the kernel fix, production ran with `FA2SM70_MTP_GRAPH=0`: no drafter graphs.
+* Proof on a GPU with the production kernel code, `sm70/tests/test_graph_keep.py`. Capture a graph at a
+  small batch, grow the buffer eagerly, place "victim" tensors of the old size, replay the graph:
+
+  | Buffer | Before the fix | After the fix |
+  |---|---|---|
+  | `w8a16_gemv` split-K | 573,440 victim elements overwritten | 0 |
+  | `_Eg` | 16,384 elements overwritten (exactly the old capacity) | 0 |
+
+  The selection of the old and new builds is bitwise identical on the same inputs.
+* **Fix.**
+  * The kernels keep every retired buffer in a static list.
+  * `_Eg` starts at 64 rows (16 requests × 4), so in production it does not grow at all.
+* `FA2SM70_DRAFT_GUARD=1` drops a draft row with an id outside [0, vocabulary) and logs it, instead of
+  crashing the engine. CPU test: `sm70/tests/test_draft_guard.py`.
+* Deployed 2026-10-14 17:35 with `FA2SM70_MTP_GRAPH=1` restored. The kernels were prebuilt into a new
+  build directory with the production environment, so startup did not recompile.
+* Checks after the restart:
+  * chat answered correctly;
+  * Clef 0.9921;
+  * an image exactly at the first chunk boundary on an idle server: "Blue.";
+  * the drafter graphs were captured again.
+
+### Open defects (fuzzing, 2026-10-14)
+
+CPU fuzzers driving the real code found defects that do not crash but change results silently. The
+fixes are tested on copies only and wait for quality gates on a test pair of GPUs: graph versus eager,
+MTP acceptance, needle ladder, Clef parity.
+
+* **GDN accepted-token count in the full graph** (`vllm/v1/attention/backends/gdn_attn.py`).
+  * With `FA2SM70_GDN_SHARED_BUF=1`, `update_block_table` skips the `num_accepted` refresh for groups 1..9.
+  * Their per-builder buffer, baked into the full decode graph at capture, therefore stays at the capture
+    values.
+  * Result: in ~84 % of speculative full-graph steps, 43 of the 48 GDN layers start from the state of a
+    wrong position.
+  * The GRAN_SRC/DST state-block-boundary substitutions are also applied to group 0 only.
+  * Fix: share the buffer, and rebuild groups 1..9 on boundary steps. Fuzzer mismatches go to 0.
+* **A 4-token prefill chunk runs as uniform decode.** `_is_uniform_decode` counts tokens only, so such a
+  chunk replays the full graph with stale speculative metadata. Fix pending in the runner.
+* **Clef record preempted mid-prefill.**
+  * The runner keeps the request, so `req_begin` is not called again.
+  * `span_add_k` then accumulates the already processed positions a second time.
+  * Fix: track the expected next position per slot and restart the record when it does not match.
+* **Padded rows of the MTP drafter batch** (`eagle.py`, `_дополнить_мету`). When the number of real rows
+  shrinks for the same padded size, the padded rows keep the previous step's sequence lengths and slots,
+  and the draft layer writes K/V into other requests' slots.
+* **Configuration limit.** The sparse decode selection supports at most 4096 key blocks per row. With
+  `FA2SM70_SPARSE_B=64` that is exactly a 262,144-token table.
+* Ruled out by the same fuzzers: the encoder scheduling for the drafter (900,000 cases, 0 violations in
+  the production mode), the virtual batch and selection bounds, and Clef segments without preemption.
+
 ## Known effects and hazards
 
 * **Decode numerics depend on GPU memory layout.** With MTP speculation, any change in the memory

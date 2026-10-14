@@ -215,6 +215,13 @@ _ПРОПУСК_МЕТЫ_ЧЕРНОВИКА = os.environ.get("FA2SM70_SKIP_DRAFT
 # Откат -- FA2SM70_GDN_GRAN_SKIP=0.
 _ГРАН_ПРОПУСК = os.environ.get("FA2SM70_GDN_GRAN_SKIP", "1") == "1"
 _ГРАН_ЛОГ = os.environ.get("FA2SM70_GDN_GRAN_LOG", "0") == "1"
+# [ПРОВЕРКА НОМЕРОВ ЧЕРНОВИКА -- 14.10] Номер чернового токена вне [0, словарь) до планировщика доходил
+# без единой проверки: >= 2^31 ронял движок OverflowError в token_ids_cpu (14.10: 85899345940), а
+# [словарь, 2^31) уходил в input_ids и в ядро приёмки (чтение за границей вероятностей). Черновик --
+# только ускорение, поэтому такая строка просто идёт без спекуляции, а в журнал пишется подпись
+# (hex, строка, запрос): падение превращается в пропущенный шаг и называет источник. Цена -- B*k
+# сравнений питоновских чисел на шаг. Рычаг FA2SM70_DRAFT_GUARD=1, по умолчанию выкл (venv общий).
+_ПРОВЕРКА_ЧЕРНОВИКА = os.environ.get("FA2SM70_DRAFT_GUARD", "0") == "1"
 # Отброс бонусного токена у границы блока (записка 25 §123). Рычаг отката.
 # ОТБРОС БОНУСНОГО ТОКЕНА У ГРАНИЦЫ -- ГИПОТЕЗА ОПРОВЕРГНУТА ЗАМЕРОМ (04.09).
 # Обрыв объяснялся неверным бонусным токеном; правка исполнялась (пометка PLACEHOLDER
@@ -4903,7 +4910,10 @@ class GPUModelRunner(
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
-            return self._гран_пропуск(self._draft_token_ids, self.input_batch.req_ids), self.input_batch.req_ids
+            _спис = self._draft_token_ids
+            if _ПРОВЕРКА_ЧЕРНОВИКА:
+                _спис = self._черновик_в_словаре(_спис, self.input_batch.req_ids)
+            return self._гран_пропуск(_спис, self.input_batch.req_ids), self.input_batch.req_ids
         req_ids = self._draft_token_req_ids
         if req_ids is None:
             return [], []
@@ -4911,7 +4921,29 @@ class GPUModelRunner(
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
         _спис = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        if _ПРОВЕРКА_ЧЕРНОВИКА:
+            _спис = self._черновик_в_словаре(_спис, req_ids)
         return self._гран_пропуск(_спис, req_ids), req_ids
+
+    def _черновик_в_словаре(self, спис, req_ids):
+        """Строки с номером вне [0, словарь) -> пустой черновик (см. _ПРОВЕРКА_ЧЕРНОВИКА)."""
+        V = getattr(self, "_словарь_черновика", None)
+        if V is None:
+            V = self._словарь_черновика = int(self.model_config.get_vocab_size())
+        вых = None
+        for i, строка in enumerate(спис):
+            if all(0 <= т < V for т in строка):
+                continue
+            if вых is None:
+                вых = list(спис)
+            вых[i] = []
+            н = self._черновик_плохих = getattr(self, "_черновик_плохих", 0) + 1
+            if н <= 20 or н % 1000 == 0:
+                logger.warning("[fa2_sm70] черновик вне словаря (%d-й раз): строка %d запрос %s номера %s "
+                               "-- шаг идёт без спекуляции", н, i,
+                               req_ids[i] if i < len(req_ids) else "?",
+                               [hex(т) for т in строка])
+        return спис if вых is None else вых
 
     def _гран_рядом(self) -> bool:
         """Стоит ли хоть один запрос вплотную к границе блока состояния.

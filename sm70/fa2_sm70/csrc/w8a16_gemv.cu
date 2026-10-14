@@ -388,13 +388,16 @@ torch::Tensor w8a16_gemm_hmma(torch::Tensor x, torch::Tensor qweight, torch::Ten
     // дальше -- эпилог предыдущего вызова (тот же приём, что у gemv: адрес стабилен, значит
     // захват в CUDA-граф законен и ни одного пуска обнуления на вызов).
     static std::unordered_map<int, torch::Tensor> кэш_hmma;
+    static std::vector<torch::Tensor> кэш_hmma_старые;   // [14.10] адрес запечён в графах -- не отпускать
     // Слот НА КАЖДОЕ расщепление -- см. пояснение у записи в w8a16_hmma.cuh.
     const long need = (long)ksplit * M * N;
     const int dev = (int)xc.device().index();
     auto it = кэш_hmma.find(dev);
-    if (it == кэш_hmma.end() || it->second.numel() < need)
+    if (it == кэш_hmma.end() || it->second.numel() < need) {
+      if (it != кэш_hmma.end()) кэш_hmma_старые.push_back(it->second);
       кэш_hmma[dev] = torch::zeros({max(need, (long)1 << 20)},
                                    torch::dtype(torch::kFloat32).device(xc.device()));
+    }
     float* pp = кэш_hmma[dev].data_ptr<float>();
     dim3 grid(nblk, mblk, ksplit);
     fa2_sm70::w8a16::w8a16_hmma<BN, WN, G, true><<<grid, WN * 32, 0, stream>>>(
@@ -442,6 +445,10 @@ torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor q
   // законен (свежая аллокация на каждый вызов тоже стабильна внутри графа, но тянет за собой пуск
   // обнуления, ради снятия которого всё и делается).
   static std::unordered_map<int, torch::Tensor> кэш;
+  // [ВИСЯЧИЙ АДРЕС -- 14.10] Площадка растёт с M (голова цели зовёт без графа с M = 4 x запросов), а её адрес
+  // запечён в графах тела MTP (M=4). Старую больше не отпускаем: повтор графа продолжает писать в неё и сам же
+  // её обнуляет эпилогом, чужая память не задевается.
+  static std::vector<torch::Tensor> кэш_старые;
   float* pp = nullptr;
   if (ksplit > 1) {
     // Слот НА КАЖДОЕ расщепление (было: одна общая площадка под atomicAdd). Размер ограничен
@@ -451,6 +458,7 @@ torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor q
     const int dev = (int)xc.device().index();
     auto it = кэш.find(dev);
     if (it == кэш.end() || it->second.numel() < need) {
+      if (it != кэш.end()) кэш_старые.push_back(it->second);
       кэш[dev] = torch::zeros({max(need, (long)1 << 20)},
                               torch::dtype(torch::kFloat32).device(xc.device()));
     }

@@ -842,9 +842,11 @@ void fa2sm70_sparse_select_rows(
         // 100 МиБ переходных на вызов съели запас карты (OOM на префилле 12:25). Буферы сборки СТАТИЧЕСКИЕ (растут только),
         // матрицы -- в fp16 без копий: Q переставлен в [Hkv, N, g, D] (48 КиБ), K/размах собраны в [Hkv, N*NB, D].
         static torch::Tensor _Kb, _Db; static int64_t _cap = 0;
+        static std::vector<torch::Tensor> _KbDb_keep;   // [14.10] see _Eg below: old address may be baked into a graph
         const int64_t need = (int64_t)N * NB;
         if (!_Kb.defined() || _Kb.device() != Q.device() || _cap < need) {
-            _cap = std::max<int64_t>(need, 8LL * NB);
+            if (_Kb.defined()) { _KbDb_keep.push_back(_Kb); _KbDb_keep.push_back(_Db); }
+            _cap = std::max<int64_t>(need, 64LL * NB);
             _Kb = torch::empty({(long)Hkv, (long)_cap, (long)D}, torch::dtype(torch::kFloat16).device(Q.device()));
             _Db = torch::empty({(long)Hkv, (long)_cap, (long)D}, torch::dtype(torch::kFloat16).device(Q.device()));
         }
@@ -890,10 +892,17 @@ void fa2sm70_sparse_select_rows(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const float* _Egp = nullptr;
     if (topf > 0.0) {
+        // [ВИСЯЧИЙ АДРЕС -- 14.10] Буфер растёт при росте строк виртуального батча (запросы x (k+1)), а его
+        // адрес запечён в CUDA-графах (полный граф цели, графы тела MTP): повтор графа делает memset и пишет
+        // сюда. Прежде старый тензор отпускался присваиванием -- запись шла в память нового владельца
+        // (Xid 31 / порча, разбор: docs/sm70/VALIDATION.md, инцидент 2026-10-14). Теперь: ёмкость сразу под
+        // 64 строки (16 запросов x 4) и отставленные тензоры не освобождаются никогда.
         static torch::Tensor _Eg; static int64_t _Egcap = 0;
+        static std::vector<torch::Tensor> _Eg_keep;
         const int64_t need = (int64_t)N * Hkv * NB;
         if (!_Eg.defined() || _Eg.device() != Q.device() || _Egcap < need) {
-            _Egcap = std::max<int64_t>(need, 8LL * Hkv * NB);
+            if (_Eg.defined()) _Eg_keep.push_back(_Eg);
+            _Egcap = std::max<int64_t>(need, 64LL * Hkv * NB);
             _Eg = torch::zeros({_Egcap}, torch::dtype(torch::kFloat32).device(Q.device()));
         }
         cudaMemsetAsync(_Eg.data_ptr<float>(), 0, need * sizeof(float), st);
