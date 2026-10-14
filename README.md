@@ -102,7 +102,7 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
 [`scripts/serve_qwen38_clef.sh`](scripts/serve_qwen38_clef.sh) reproduces the production server exactly:
-it loads the 101 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
+it loads the 103 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
 toolchain, chooses fp16 or int12 all-reduce from the NVLink topology, refuses busy GPUs or ports, builds
 all kernels in one process, and starts the OpenAI-compatible server with the production arguments. The first
 start compiles the kernels (15–30 min) and repacks the attention weights to W12. Both are cached in

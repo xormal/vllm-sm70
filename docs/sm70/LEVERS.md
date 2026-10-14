@@ -2,7 +2,7 @@
 
 The runtime is configured with environment variables ("levers"). They are read by the vLLM code
 under `vllm/` and the integration layer under `sm70/integrations/vllm_sm70/`. The production set,
-101 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
+103 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
 This page explains the ones that change the computation or the memory layout. All values below are the
 production values. Every default was chosen by measurement on 2× V100 32 GB, and the code next to each
 lever carries the measurement that justified it (search the name under `vllm/` and `sm70/`).
@@ -62,6 +62,8 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_MAXBATCH` | `2048` | Chunked-prefill size (`--max-num-batched-tokens`); 4096 runs out of memory on 250K prompts after image traffic |
 | `FA2SM70_SEQS` | `16` | `--max-num-seqs` |
 | `FA2SM70_MEM_TRIM_MB` | `400` | Return cached-but-free allocator blocks to the driver before a prefill step when they exceed this. With Clef enabled, the threshold is lowered by Clef's own footprint |
+| `FA2SM70_KEEP_BUFS` | `1` | Keep every attention buffer that is replaced when it grows (bit mask: 1 all, 2 per-layer fields, 4 module caches). Captured CUDA graphs keep writing to the old address; releasing it let replays corrupt whatever reused the memory. See VALIDATION.md, 2026-10-14 |
+| `FA2SM70_SELBUF_PROBE` | `20000` | Probe for that defect: a retired selection buffer is filled with a sentinel and checked every N calls; `[SELBUF] ... ИЗМЕНЁН` in the log means a graph wrote to it. `0` disables the probe |
 | `FA2SM70_W8_OOM_RETRY` | `1` | On an allocator OOM in a foreign GEMM body: empty the cache and retry once |
 | `FA2SM70_CG` | `1` | Full CUDA graph for decode (+20% decode on short contexts) |
 | `FA2SM70_MODE` | `dialog` | Group sizing tuned for interactive traffic |

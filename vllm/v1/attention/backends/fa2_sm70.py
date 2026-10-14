@@ -507,6 +507,50 @@ def _отставить_мод(*тензоры):
         for т in тензоры:
             if т is not None:
                 _ПЕНСИЯ_МОДУЛЯ.append(т)
+
+
+# [ВИСЯЧИЙ АДРЕС БУФЕРОВ ОТБОРА -- 14.10] `_sel_bufs`/`_sel_bufs_h` при росте числа строк
+# заменяли кортеж и ОТПУСКАЛИ старый без `_отставить_мод`, хотя его адрес запечён в графах
+# (полный граф цели и графы тела MTP, которые захватываются лениво, под нагрузкой). Повтор
+# такого графа пишет в память, отданную другому владельцу. Подписи 14.10: illegal memory
+# access / Xid 31 на обоих рангах и номер черновика 85899345940 = пара int32 (20, 20)
+# счётчиков отбора, прочитанная как int64. Лечение -- тот же рычаг FA2SM70_KEEP_BUFS, что и
+# у остальных модульных кэшей (маска 1 или 4). Без рычага поведение прежнее.
+# ПРИБОР FA2SM70_SELBUF_PROBE=N (0 = выкл): отставленный буфер заливается знаком, и раз в N
+# вызовов (вне захвата) сверяется. Изменился -- значит граф пишет по старому адресу.
+_SELBUF_PROBE = int(os.environ.get("FA2SM70_SELBUF_PROBE", "0") or 0)
+_SELBUF_ZNAK = 0x5A17C0DE
+_SELBUF_SLED: list = []            # [имя, int32-вид отставленного тензора, уже сообщено]
+_SELBUF_SCH = [0]
+
+
+def _selbuf_otstavit(имя: str, t) -> None:
+    if t is None:
+        return
+    _отставить_мод(*t)
+    if _SELBUF_PROBE and _ДЕРЖАТЬ_МОД and not torch.cuda.is_current_stream_capturing():
+        for i, x in enumerate(t):
+            v = x.view(torch.int32)
+            v.fill_(_SELBUF_ZNAK)
+            _SELBUF_SLED.append([f"{имя}[{i}] {tuple(x.shape)}", v, False])
+        print(f"[SELBUF] {имя}: отставлен кортеж {tuple(t[0].shape)}, под прибором "
+              f"{len(_SELBUF_SLED)} тензоров", flush=True)
+
+
+def _selbuf_proverit(причина: str) -> None:
+    for з in _SELBUF_SLED:
+        if not з[2] and bool((з[1] != _SELBUF_ZNAK).any()):
+            з[2] = True
+            print(f"[SELBUF] отставленный буфер {з[0]} ИЗМЕНЁН после отставки ({причина}): "
+                  f"граф пишет по старому адресу", flush=True)
+
+
+def _selbuf_shag() -> None:
+    if not _SELBUF_SLED:
+        return
+    _SELBUF_SCH[0] += 1
+    if _SELBUF_SCH[0] % _SELBUF_PROBE == 0 and not torch.cuda.is_current_stream_capturing():
+        _selbuf_proverit(f"вызов {_SELBUF_SCH[0]}")
 _TREEBUF: dict = {}
 _TREEMASKS: dict = {}
 
@@ -602,9 +646,14 @@ def _sel_bufs(N: int, Hkv: int, NB: int, device):
     обязан быть тем же при повторе.
     """
     k = str(device)
+    if _SELBUF_PROBE:
+        _selbuf_shag()
     t = _SELBUF.get(k)
     if t is None or t[0].shape[0] < N or t[0].shape[1] != Hkv or t[1].shape[2] < NB:
         n2, nb2 = max(N, 8), max(NB, 512)
+        if _SELBUF_PROBE:
+            _selbuf_proverit("перед отставкой")
+        _selbuf_otstavit("_SELBUF", t)
         t = _SELBUF[k] = (
             torch.zeros(n2, Hkv, dtype=torch.int32, device=device),
             torch.zeros(n2, Hkv, nb2, dtype=torch.int32, device=device),
@@ -623,6 +672,7 @@ def _sel_bufs_h(N: int, Hkv: int, NBg: int, device):
     t = _SELBUF_H.get(k)
     if t is None or t[0].shape[0] < N or t[0].shape[1] != Hkv or t[0].shape[2] < NBg:
         n2 = max(N, 8)
+        _selbuf_otstavit("_SELBUF_H", t)
         t = _SELBUF_H[k] = (torch.zeros(n2, Hkv, NBg, dtype=torch.float32, device=device),
                             torch.zeros(n2, Hkv, NBg, dtype=torch.float32, device=device))
     return (t[0][:N, :, :NBg], t[1][:N, :, :NBg])

@@ -113,6 +113,56 @@ records, most of them with images. The autostart loop brought it back in 6 minut
 client keeps a streaming request open after the engine is gone. A second signal did not help; the
 API server had to be killed. The GPUs were already free at that point.
 
+### Incident 2026-10-14: graph replays wrote to released selection buffers
+
+**What happened.** Production died three times in two hours:
+* 13:22, `CUDA error: an illegal memory access` with an MMU fault (Xid 31) on both GPUs at once;
+* 13:33, `OverflowError: Python integer 85899345940 out of bounds for int32` while scheduled draft
+  tokens were written into `token_ids_cpu`;
+* 14:24, an MMU fault again.
+
+Two crashes came 10 s and 73 s after the number of concurrent requests reached a new maximum for
+the process. In the month before, no crash of this class appeared, with the same code and similar
+traffic. Why it started that day is not established.
+
+**Cause: buffers that are replaced when they grow, while captured CUDA graphs keep their address.**
+* The sparse-decode selection buffers (`_sel_bufs`, `_sel_bufs_h` in
+  `vllm/v1/attention/backends/fa2_sm70.py`) are module-level and shared by every attention layer,
+  including the MTP drafter's.
+* When the virtual batch (requests × (k+1) rows) grew past its largest size so far, a new tuple
+  was allocated and the old one released.
+* The full decode graph and the drafter's own graphs, captured lazily under load, had baked the old
+  address and kept writing to it. That memory went to other tensors or back to the driver (memory
+  trim).
+* 85899345940 is `0x00000014_00000014`: a pair of int32 selection counts (20, 20) of one row with two
+  KV heads, read as one int64 draft token id.
+* The same class was fixed for the GDN state indices on 2026-09-08. The selection buffers came later
+  with sparse decode and were never covered.
+
+**Fix.**
+* The selection buffers now retire through the same keep-list as the other module caches.
+* `FA2SM70_KEEP_BUFS=1` keeps every retired attention buffer, the selection buffers and the per-layer
+  workspace alike.
+* `FA2SM70_SELBUF_PROBE=N` fills a retired selection buffer with a sentinel and checks it every N
+  calls, outside graph capture.
+
+**Validation:**
+* `sm70/tests/test_selbuf_keep.py` (CPU) covers three properties:
+  * without the levers the old buffer is released exactly as before;
+  * with them it is kept;
+  * the probe reports a write to a retired buffer and stays silent otherwise.
+* **In production the probe proved the mechanism.** Minutes after the restart the rows grew from 8 to
+  12, then further. On both ranks the sentinel was overwritten in every retired tensor (`_SELBUF[0..3]`,
+  `_SELBUF_H[0..1]`), i.e. captured graphs kept writing to the old addresses.
+* Ruled out by fuzzing:
+  * the context n-gram drafter: 1.6 M calls, never an id outside the vocabulary;
+  * the draft hand-off from runner to scheduler: 264 k steps on the real code. It can produce this value
+    only by reading a pinned row that was not written in this step, which the real code does not do;
+  * the int4 draft argmax: inactive in production;
+  * hardware: NVLink, PCIe and ECC counters clean.
+* After the restart: chat, Clef, and an image exactly at the first chunk boundary all answered
+  correctly.
+
 ## Known effects and hazards
 
 * **Decode numerics depend on GPU memory layout.** With MTP speculation, any change in the memory
