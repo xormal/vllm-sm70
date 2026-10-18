@@ -87,7 +87,7 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
 Пускач точно воспроизводит боевой сервер:
-- подгружает 105 рычагов из [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env);
+- подгружает 108 рычагов из [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env);
 - проверяет компилятор;
 - выбирает обмен fp16 или int12 по топологии NVLink;
 - отказывает, если карты или порт заняты;

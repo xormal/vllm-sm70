@@ -2,7 +2,7 @@
 
 The runtime is configured with environment variables ("levers"). They are read by the vLLM code
 under `vllm/` and the integration layer under `sm70/integrations/vllm_sm70/`. The production set,
-105 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
+108 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
 This page explains the ones that change the computation or the memory layout. All values below are the
 production values. Every default was chosen by measurement on 2× V100 32 GB, and the code next to each
 lever carries the measurement that justified it (search the name under `vllm/` and `sm70/`).
@@ -74,6 +74,8 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_SELBUF_PROBE` | `20000` | Probe for that defect: a retired selection buffer is filled with a sentinel and checked every N calls; `[SELBUF] ... ИЗМЕНЁН` in the log means a graph wrote to it. `0` disables the probe |
 | `FA2SM70_FREE_UNHASHED_HEAD` | `0` (**stand**: `1`) | Freed blocks without a hash go to the head of the free queue (taken first), hashed ones to the tail. At `0` everything goes to the tail, and admitting Clef records evicts the early-released hashed GDN blocks of the prefix cache before empty ones |
 | `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1` | `0` (**stand**: `1`) | Do not reserve the speculative GDN blocks for requests with `max_tokens=1` (Clef records): they never decode |
+| `FA2SM70_KV_OFFLOAD`, `FA2SM70_KV_OFFLOAD_GB` | `0`, `16` | Host-RAM KV offload: a block of 16,384 tokens of all groups (attention K/V with both scale tables, the sparse-selection `_KBAR`/`_DEVP` rows, the GDN page and its int16 scales) is copied to pinned host memory when prefill completes it; a request whose prefix left the GPU pool gets it back by a copy (~0.05 s per block) instead of prefill. `_GB` is for the whole server: 16 → 24 slots, 393K tokens, 7.6 GiB pinned per rank. Off in production; the launcher adds `--kv-transfer-config` and `--no-disable-hybrid-kv-cache-manager` at `1` |
+| `FA2SM70_KV_OFFLOAD_TRACE`, `FA2SM70_KV_OFFLOAD_SYNC`, `FA2SM70_KV_OFFLOAD_LOG_S` | `0`, unset, unset | Diagnostics: a line per hit and write; copies on the main stream; period of the accounting line (60 s) |
 | `FA2SM70_W8_OOM_RETRY` | `1` | On an allocator OOM in a foreign GEMM body: empty the cache and retry once |
 | `FA2SM70_CG` | `1` | Full CUDA graph for decode (+20% decode on short contexts) |
 | `FA2SM70_MODE` | `dialog` | Group sizing tuned for interactive traffic |

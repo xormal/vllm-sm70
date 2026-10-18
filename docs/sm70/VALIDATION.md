@@ -248,6 +248,26 @@ production venv stayed untouched. Every fix is a lever with default `0` (LEVERS.
 * The stand then served real traffic with all of the above enabled: Clef equal to the reference (158 values,
   max |Δ| 0), needle at 60K found, mixed Clef + chat load all correct, MTP acceptance 2.33.
 
+### Host-RAM KV offload (2026-10-16 … 10-18, off in production)
+
+`FA2SM70_KV_OFFLOAD=1` (`sm70/integrations/vllm_sm70/fa2sm70_kv_offload.py`). The stock
+`OffloadingConnector` does not fit this model: it is not `SupportsHMA` (vLLM then disables the hybrid manager
+that GDN needs), it wants one page size for all groups, and it copies by `stride(0)`, which misses the carved
+int8 scale tables and the selection side tables.
+
+* CPU harness on the real `Scheduler`: 0 label failures, corruption control 29,526; GPU: byte-exact
+  round trip of every piece of a block.
+* Stand, without the prefix-cache levers, after Clef load (the GPU cache held 0 of the documents): a
+  21,391-token repeat got 16,384 tokens from RAM (4.2 s instead of 16.2 s), a 56,951-token repeat 49,152
+  (7.0 s instead of 44.5 s). Peak GPU memory unchanged.
+* Identity (`sm70/tests/server/probe_ozu_ident.py`, `probe_ozu_ident2.py`): one block restored from RAM is
+  byte-equal to a GPU hit (tokens, logprobs, top-5). With 2 and 3 blocks the prefill output and the first
+  ~19 tokens are byte-equal and logprobs diverge from position ~20 by ~1e-2. Two repeats that both hit the
+  GPU cache on the same blocks diverge from position 20 as well (4.5e-3): that is the server's own repeat
+  nondeterminism, not the connector.
+* With `FA2SM70_FREE_UNHASHED_HEAD` and `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1` the GPU cache alone keeps those
+  documents, and the RAM tier is not reached in the same scenario.
+
 ### Open defects (fuzzing, 2026-10-14)
 
 CPU fuzzers driving the real code found defects that do not crash but change results silently. The

@@ -137,6 +137,14 @@ ARGS=(
   --speculative-config "{\"method\":\"mtp\",\"model\":\"$MODEL_DIR\",\"num_speculative_tokens\":3}"
 )
 
+# Host-RAM KV offload (second prefix-cache tier, sm70/integrations/vllm_sm70/fa2sm70_kv_offload.py).
+# Off in production; FA2SM70_KV_OFFLOAD_GB is pinned host memory for the whole server, split between ranks.
+if [ "${FA2SM70_KV_OFFLOAD:-0}" = "1" ]; then
+  ARGS+=(--kv-transfer-config '{"kv_connector":"Fa2Sm70OffloadConnector","kv_connector_module_path":"fa2sm70_kv_offload","kv_role":"kv_both"}'
+        --no-disable-hybrid-kv-cache-manager)
+  say "KV offload to host RAM: ${FA2SM70_KV_OFFLOAD_GB:-16} GiB for the server"
+fi
+
 if [ "${DRYRUN:-0}" = "1" ]; then
   say "resolved environment:"
   env | grep -E '^(FA2SM70_|VLLM_|CUDA_|NCCL_|PYTORCH_|TORCH_|CC=|CXX=|PYTHONPATH=)' | sort | sed 's/^/    /'

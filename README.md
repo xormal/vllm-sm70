@@ -102,7 +102,7 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
 [`scripts/serve_qwen38_clef.sh`](scripts/serve_qwen38_clef.sh) reproduces the production server exactly:
-it loads the 105 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
+it loads the 108 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
 toolchain, chooses fp16 or int12 all-reduce from the NVLink topology, refuses busy GPUs or ports, builds
 all kernels in one process, and starts the OpenAI-compatible server with the production arguments. The first
 start compiles the kernels (15–30 min) and repacks the attention weights to W12. Both are cached in
@@ -241,7 +241,9 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
      mean keys refreshed for every request of a decode batch (`FA2SM70_BLKMEAN_ALL`), placeholder slots for
      padded drafter rows (`FA2SM70_PAD_META_FIX`), prefix-cache retention under Clef load
      (`FA2SM70_FREE_UNHASHED_HEAD`, `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1`), Clef records restarted after
-     preemption (`FA2SM70_CLEF_A1`).
+     preemption (`FA2SM70_CLEF_A1`);
+   * 2026-10-16: an optional host-RAM KV offload connector, a second prefix-cache tier that survives GDN block
+     eviction under Clef load (`FA2SM70_KV_OFFLOAD`, off in production).
 
 `git log 437b358e5..sm70` shows each step with a description.
 
