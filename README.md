@@ -102,7 +102,7 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
 [`scripts/serve_qwen38_clef.sh`](scripts/serve_qwen38_clef.sh) reproduces the production server exactly:
-it loads the 104 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
+it loads the 105 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
 toolchain, chooses fp16 or int12 all-reduce from the NVLink topology, refuses busy GPUs or ports, builds
 all kernels in one process, and starts the OpenAI-compatible server with the production arguments. The first
 start compiles the kernels (15–30 min) and repacks the attention weights to W12. Both are cached in
@@ -234,7 +234,9 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
    * 2026-10-13: the image encoder is scheduled for the MTP drafter's shifted window (`FA2SM70_MM_DRAFT_SHIFT`);
    * 2026-10-14: buffers that grow while captured CUDA graphs still use their address are kept instead of
      released, in Python (`FA2SM70_KEEP_BUFS`) and in the kernels (`sparse_select.cu`, `w8a16_gemv.cu`); draft
-     token ids are range-checked before scheduling (`FA2SM70_DRAFT_GUARD`).
+     token ids are range-checked before scheduling (`FA2SM70_DRAFT_GUARD`);
+   * 2026-10-18: a prefill chunk of exactly k+1 = 4 tokens is no longer taken for a uniform speculative
+     decode step and replayed through the full graph on stale GDN state (`FA2SM70_UNIFORM_PREFILL_FIX`).
 
 `git log 437b358e5..sm70` shows each step with a description.
 

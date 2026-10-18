@@ -2,7 +2,7 @@
 
 The runtime is configured with environment variables ("levers"). They are read by the vLLM code
 under `vllm/` and the integration layer under `sm70/integrations/vllm_sm70/`. The production set,
-104 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
+105 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
 This page explains the ones that change the computation or the memory layout. All values below are the
 production values. Every default was chosen by measurement on 2× V100 32 GB, and the code next to each
 lever carries the measurement that justified it (search the name under `vllm/` and `sm70/`).
@@ -52,6 +52,7 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_MTP_NGRAM`, `FA2SM70_MTP_NGRAM_FIX` | `1`, `1` | n-gram proposals from the context when they out-accept the MTP head. Wins on copying, costs nothing on prose; the target still verifies every token |
 | `FA2SM70_DRAFT_TM8` | `1` | Drafter linear layers on the turbomind int8 body |
 | `FA2SM70_GRAN_SRC`, `FA2SM70_GRAN_DST`, `FA2SM70_GRAN_CONV_ALL` | `1`, `1`, `0` | Block-granularity fixes for state copies under speculation |
+| `FA2SM70_UNIFORM_PREFILL_FIX` | `1` | A step counts as uniform speculative decode only if every row carries k draft tokens. Without it a prefill chunk of exactly k+1 = 4 tokens (one request, prompt length 2048·m + 4) replays the full speculative graph on stale GDN spec state, and the answer turns to garbage. See VALIDATION.md, 2026-10-18 |
 | `FA2SM70_ASYNC_SCHED` | `0` | Async scheduling off (required for MTP correctness at block boundaries) |
 | `FA2SM70_MTP` | `0` | Legacy switch of the old launcher. The MTP config is passed explicitly on the command line |
 

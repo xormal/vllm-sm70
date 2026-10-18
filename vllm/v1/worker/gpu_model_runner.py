@@ -201,6 +201,10 @@ if TYPE_CHECKING:
 _ДБГ_СЛОИ_ВКЛ = _os.environ.get("FA2SM70_DBG_LAYERS", "0") == "1"
 
 logger = init_logger(__name__)
+# [18.10] Чанк префилла из k+1 токенов не считать однородным декодом спекуляции. Умолчание 0.
+_UNIFORM_PREFILL_FIX = os.environ.get("FA2SM70_UNIFORM_PREFILL_FIX", "0") == "1"
+if _UNIFORM_PREFILL_FIX:
+    logger.info("[fa2_sm70 18.10] UNIFORM_PREFILL_FIX=1 (%s)", __file__)
 
 # Пропуск построения метаданных для группы черновика (см. _build_attn_group_metadata).
 _ПРОПУСК_МЕТЫ_ЧЕРНОВИКА = os.environ.get("FA2SM70_SKIP_DRAFT_META", "0") == "1"
@@ -3825,6 +3829,30 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _fa2sm70_ne_odnorodnyj(self, scheduler_output, num_reqs, max_num_scheduled_tokens):
+        """[18.10, ФАЗЗИНГ 14.10 gdnmeta, находка 2] FA2SM70_UNIFORM_PREFILL_FIX=1.
+
+        `_is_uniform_decode` смотрит только на ЧИСЛО токенов: чанк префилла ровно из k+1 токенов
+        (а с ним <= 1 спец-запрос) считается однородным декодом и идёт ПОЛНЫМ графом спекуляции,
+        где строитель GDN не обновляет постоянные spec_state/qsl/nacc -- граф идёт по устаревшим
+        и пишет состояние в блоки чужого запроса. Однородный -- только если у КАЖДОЙ строки ровно
+        k черновых токенов. Возврат False = «не однородный», None = решать как раньше.
+        """
+        if not _UNIFORM_PREFILL_FIX:
+            return None
+        k1 = self.uniform_decode_query_len
+        if k1 <= 1 or max_num_scheduled_tokens != k1:
+            return None
+        sd = scheduler_output.scheduled_spec_decode_tokens
+        if len(sd) != num_reqs or any(len(v) != k1 - 1 for v in sd.values()):
+            self._fa2sm70_ne_odn_n = getattr(self, "_fa2sm70_ne_odn_n", 0) + 1
+            if self._fa2sm70_ne_odn_n <= 3 or self._fa2sm70_ne_odn_n % 256 == 0:
+                logger.info("[fa2_sm70 ОДНОРОДНЫЙ] шаг из %d строк по %d токенов -- НЕ декод "
+                            "спекуляции (чанк префилла), полный граф спекуляции не берётся (%d раз)",
+                            num_reqs, k1, self._fa2sm70_ne_odn_n)
+            return False
+        return None
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4237,6 +4265,8 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_uniform_decode=self._fa2sm70_ne_odnorodnyj(
+                    scheduler_output, num_reqs, max_num_scheduled_tokens),
             )
 
             logger.debug(

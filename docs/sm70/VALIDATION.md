@@ -191,6 +191,24 @@ traffic. Why it started that day is not established.
   * an image exactly at the first chunk boundary on an idle server: "Blue.";
   * the drafter graphs were captured again.
 
+### Fix 2026-10-18: a 4-token prefill chunk ran as uniform speculative decode (production)
+
+Found by the 2026-10-14 fuzzers, reproduced and fixed on a test pair of GPUs, in production since
+2026-10-18 17:14 (`FA2SM70_UNIFORM_PREFILL_FIX=1`).
+
+* `_is_uniform_decode` looks only at the number of scheduled tokens. A single request whose last prefill
+  chunk is exactly k+1 = 4 tokens (prompt length 2048·m + 4) looks like one speculative decode row.
+* That step replays the full speculative CUDA graph. The GDN metadata builder does not refresh the
+  persistent spec state for it, so the graph runs on stale state and writes into another request's blocks.
+  The answer turns to garbage from the first token.
+* Fix (`gpu_model_runner._fa2sm70_ne_odnorodnyj`): a step is uniform only if every row carries exactly k
+  draft tokens; otherwise `force_uniform_decode=False` and the step takes the piecewise path.
+* Stand, `sm70/tests/server/probe_uniform.py` (one request of length 2048·m + 4 against the same request
+  chunked differently next to a decoding neighbour): before the fix L = 2052 and 4100 gave different greedy
+  tokens (max |Δ logprob| 4.96 and 5.30); after it the tokens match, and the residual |Δ logprob| (0.18,
+  0.16) is the server's own repeat noise. Controls 2051 and 2053 (last chunk 3 and 5 tokens) unchanged.
+  Base logprobs bitwise identical to the unpatched server, Clef 70/70 with max |Δp| 0.
+
 ### Open defects (fuzzing, 2026-10-14)
 
 CPU fuzzers driving the real code found defects that do not crash but change results silently. The
@@ -205,8 +223,6 @@ MTP acceptance, needle ladder, Clef parity.
     wrong position.
   * The GRAN_SRC/DST state-block-boundary substitutions are also applied to group 0 only.
   * Fix: share the buffer, and rebuild groups 1..9 on boundary steps. Fuzzer mismatches go to 0.
-* **A 4-token prefill chunk runs as uniform decode.** `_is_uniform_decode` counts tokens only, so such a
-  chunk replays the full graph with stale speculative metadata. Fix pending in the runner.
 * **Clef record preempted mid-prefill.**
   * The runner keeps the request, so `req_begin` is not called again.
   * `span_add_k` then accumulates the already processed positions a second time.
