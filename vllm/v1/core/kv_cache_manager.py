@@ -9,6 +9,12 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core import fa2sm70_tail
+import os as _os_f3
+
+# [18.10] F3: без резерва блоков спекуляции GDN для запросов с max_tokens=1. Умолчание 0.
+_NO_SPEC_MAXTOK1 = _os_f3.environ.get("FA2SM70_NO_SPEC_BLOCKS_MAXTOK1", "0") == "1"
+if _NO_SPEC_MAXTOK1:
+    print(f"[fa2_sm70 18.10] NO_SPEC_BLOCKS_MAXTOK1=1 ({__file__})", flush=True)
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -443,6 +449,12 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
+        if _NO_SPEC_MAXTOK1 and getattr(request, "max_tokens", None) == 1:
+            # [18.10, F3] декода у такого запроса не будет -- блоки спекуляции GDN не резервировать
+            for _mgr in self.coordinator.single_type_managers:
+                _бс = getattr(_mgr, "_без_спец", None)
+                if _бс is not None:
+                    _бс.add(request.request_id)
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "

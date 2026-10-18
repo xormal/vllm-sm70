@@ -59,6 +59,11 @@ _R = int(os.environ.get("FA2SM70_CLEF_R", "2"))
 _OUT = os.environ.get("FA2SM70_CLEF_OUT", "/dev/shm/fa2sm70_clef")
 _NMAX = int(os.environ.get("FA2SM70_CLEF_NMAX", "16384"))
 _MEDIA = os.environ.get("FA2SM70_CLEF_MEDIA", "0") == "1"
+# [18.10, фаззинг 14.10 clefvb A1] Вытеснение посреди префилла: кусок не продолжает сложенное ->
+# ячейку отпустить и принять запрос заново (без этого спаны складывались дважды). Умолчание 0.
+_A1 = os.environ.get("FA2SM70_CLEF_A1", "0") == "1"
+if _A1:
+    print(f"[fa2_sm70 18.10] CLEF_A1=1 ({__file__})", flush=True)
 _IMGMAX = int(os.environ.get("FA2SM70_CLEF_IMGMAX", "16"))
 IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 # диагностика (12.10): in_proj_ba остаётся штатным (своя операция не ставится, поправка ba не действует)
@@ -88,6 +93,10 @@ class _Состояние:
         self.lm_head = None
         self.ok = False
         self.otkaz = set()       # req_id запросов, которым отказано (до их конца)
+        # ВЫТЕСНЕНИЕ (14.10): req_id -> позиция, с которой обязан начаться следующий кусок. Вытесненный
+        # запрос остаётся в runner.requests (ячейка цела), а после возврата его num_computed = 0
+        # (skip_reading_prefix_cache): без сверки отвод сложил бы пройденные позиции в спаны второй раз.
+        self.next = {}
 
 
 _С = _Состояние()
@@ -316,6 +325,7 @@ def _шаг(runner, so):
     for rid in list(_С.slots):
         if rid in so.finished_req_ids or rid not in runner.requests:
             slot = _С.slots.pop(rid)[0]
+            _С.next.pop(rid, None)
             if _С.golova:
                 _С.ext.req_end(slot)
             _С.free.append(slot)
@@ -333,6 +343,14 @@ def _шаг(runner, so):
             if rid in _С.otkaz:
                 row0 += n
                 continue
+            if _A1 and rid in _С.slots and pos0 != _С.next.get(rid, 0):
+                # кусок не продолжает уже сложенное (вытеснение и возврат с нуля): ячейку отпустить
+                # и принять запрос заново -- req_begin обнулит спаны; pos0 != 0 -- отказ ниже
+                slot = _С.slots.pop(rid)[0]
+                _лог(f"запрос {rid}: кусок с позиции {pos0}, а сложено до {_С.next.pop(rid, 0)} -- приём заново")
+                if _С.golova:
+                    _С.ext.req_end(slot)
+                _С.free.append(slot)
             if rid not in _С.slots:
                 try:
                     if pos0 != 0:
@@ -349,6 +367,7 @@ def _шаг(runner, so):
             slot, key, N = _С.slots[rid]
             fin = int(pos0 + n >= N)
             segs.append((row0, n, slot, pos0, fin))
+            _С.next[rid] = pos0 + n
         row0 += n
     if segs:
         runner._clef_segs = np.array(segs, dtype=np.int32)

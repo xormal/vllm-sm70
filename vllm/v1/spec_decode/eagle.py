@@ -180,6 +180,11 @@ def _хф(runner, имя, т0):
             ф("  чер/х: " + имя, _t_eagle.perf_counter() - т0)
 
 PADDING_SLOT_ID = -1
+# [18.10] Возврат заглушек в хвост дополненной меты черновика (см. _дополнить_мету). Умолчание 0.
+_PAD_META_FIX = __import__("os").environ.get("FA2SM70_PAD_META_FIX", "0") == "1"
+_PAD_META_PROBE = __import__("os").environ.get("FA2SM70_PAD_META_PROBE", "0") == "1"
+if _PAD_META_FIX:
+    print(f"[fa2_sm70 18.10] PAD_META_FIX=1 ({__file__})", flush=True)
 
 
 class SpecDecodeBaseProposer:
@@ -535,6 +540,29 @@ class SpecDecodeBaseProposer:
                 "sl": torch.full((всего,), PADDING_SLOT_ID, device=_у,
                                  dtype=cad.slot_mapping.dtype),
             }
+        if _PAD_META_PROBE:
+            # прибор стенда 18.10: сколько строк хвоста уйдёт черновику с НАСТОЯЩИМ (чужим) слотом
+            _пр = self.__dict__.setdefault("_pad_probe", {"вызовов": 0, "сжатий": 0, "строк_чужих": 0, "вм": 0})
+            _пр["вызовов"] += 1
+            _вм = max(_пр["вм"], реальных)
+            if _вм > реальных:
+                _пр["сжатий"] += 1
+                if not _PAD_META_FIX:
+                    _пр["строк_чужих"] += _вм - реальных
+            _пр["вм"] = реальных if _PAD_META_FIX else _вм
+            if _пр["вызовов"] % 2000 == 0:
+                logger.info("[fa2_sm70 PAD_META_PROBE] fix=%d %s", int(_PAD_META_FIX), dict(_пр))
+        if _PAD_META_FIX:
+            # [ФАЗЗИНГ 14.10, encsched] Хвост [реальных, грязь) хранит НАСТОЯЩИЕ seq_len / строку
+            # таблицы / СЛОТ прошлого вызова с большим `реальных` (2 из 4 -> 1 из 4): слой черновика
+            # писал K/V в слот чужого или завершённого запроса. Возвращаем заглушки только там,
+            # где `реальных` уменьшилось -- в обычном шаге лишних пусков нет.
+            _гр = б.get("грязь", 0)
+            if _гр > реальных:
+                б["seq"][реальных:_гр].fill_(1)
+                б["bt"][реальных:_гр].zero_()
+                б["sl"][реальных:_гр].fill_(PADDING_SLOT_ID)
+            б["грязь"] = реальных
         б["seq"][:реальных].copy_(cad.seq_lens[:реальных], non_blocking=True)
         б["bt"][:реальных].copy_(cad.block_table_tensor[:реальных], non_blocking=True)
         б["sl"][:реальных].copy_(cad.slot_mapping[:реальных], non_blocking=True)

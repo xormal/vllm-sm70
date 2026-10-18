@@ -761,6 +761,9 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # [18.10, F3] запросы, которым блоки спекуляции не нужны (max_tokens=1: декода не будет);
+        # заполняет KVCacheManager.allocate_slots при FA2SM70_NO_SPEC_BLOCKS_MAXTOK1=1
+        self._без_спец: set = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -880,7 +883,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
+            if self.num_speculative_blocks > 0 and request_id not in self._без_спец:
                 num_tokens += (
                     self.kv_cache_spec.block_size * self.num_speculative_blocks
                 )
@@ -928,7 +931,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
+            if self.num_speculative_blocks > 0 and request_id not in self._без_спец:
                 num_tokens += self.block_size * self.num_speculative_blocks
             return super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
@@ -998,6 +1001,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 return req_blocks[prev_block_len:]
 
     def free(self, request_id: str) -> None:
+        self._без_спец.discard(request_id)
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)

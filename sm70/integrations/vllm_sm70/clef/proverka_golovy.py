@@ -42,7 +42,7 @@ torch.zeros(1, device=dev)
 ext.init_delta(1, 2048, 264)
 ext.finalize_delta()
 u0 = used()
-W = clef_golova.zagruzit(ext, args.golova)
+W = clef_golova.zagruzit(ext, args.golova, Nmax=max(16384, args.N))   # иначе N > 16384 не помещается
 u1 = used()
 
 # ---------------------------------------------------------------- запрос

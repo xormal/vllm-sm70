@@ -209,6 +209,45 @@ Found by the 2026-10-14 fuzzers, reproduced and fixed on a test pair of GPUs, in
   0.16) is the server's own repeat noise. Controls 2051 and 2053 (last chunk 3 and 5 tokens) unchanged.
   Base logprobs bitwise identical to the unpatched server, Clef 70/70 with max |Δp| 0.
 
+### Stand 2026-10-18: fixes verified, not yet in production
+
+A test pair of GPUs (GPU0-1, PCIe, `NCCL_P2P_DISABLE=1`) ran the production stack with a vLLM copy, so the
+production venv stayed untouched. Every fix is a lever with default `0` (LEVERS.md, marked **stand**).
+
+* **Sparse decode: stale mean keys for every request but the first in a decode batch** (`FA2SM70_BLKMEAN_ALL`,
+  `sm70/fa2_sm70/csrc/sparse_select.cu`). This defect **is live in production** until the lever is enabled.
+  * `blk_mean_update` takes the slot list in slices of 64 and recomputed only the sub-block of the first slot.
+    After a decode step a slice holds k+1 = 4 slots of up to 16 requests (64 requests without MTP). The
+    sub-blocks decode wrote for the other requests kept old means (zeros for a new sub-block).
+  * Sparse decode (contexts from 16,384 tokens) then skipped those sub-blocks once they left the 512-token
+    recent window. A prefill chunk that runs alone is correct; in a mixed step (decode rows followed by a
+    prefill chunk) the slices no longer start at sub-block boundaries, and some prompt sub-blocks of the
+    chunk are missed too (unit test, mixed slice: 5 of 8 right before the fix).
+  * Symptom (`sm70/tests/server/probe_recall.py`: 8 parallel chats, 22-26K context, the model writes a code
+    first and repeats it after 1-2K tokens): 5/16 correct, the wrong ones "almost right" (482910 instead of
+    482915). A live audit of the table (means recomputed from the KV every 50 steps) showed batch position 0
+    clean and positions 1..6 100 % stale.
+  * With the fix: recall 16/16, audit 0 stale over 2,350 steps with up to 7 requests and batch reshuffles.
+    `sm70/tests/test_blkmean_update.py` (GPU): 7/33 touched sub-blocks right before, 33/33 after.
+* **Padded drafter rows** (`FA2SM70_PAD_META_FIX`, open defect below). Under real load, 752 of 2000 padded
+  drafter calls carried real slots of a previous call in the padded tail: 3858 rows where the draft layer
+  wrote K/V into another request's slot. With the fix: 0. MTP acceptance was indistinguishable in this
+  scenario (2.29 without, 2.31 with) and recall 16/16 either way, so the stray writes mostly land on
+  positions the drafter rewrites anyway. The fix costs nothing on a normal step.
+* **Prefix cache under Clef load** (`FA2SM70_FREE_UNHASHED_HEAD`, `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1`,
+  `sm70/tests/server/probe_prefix2.py`). A document repeated after Clef load: 21,391 tokens hit 0 → 16,384
+  (16.2 s → 4.1 s); 56,951 tokens hit 0 → 49,152 (44.5 s → 6.9 s); the control without load is unchanged
+  (16,384 hit, 4.3 s → 4.2 s).
+* **Clef record preempted mid-prefill** (`FA2SM70_CLEF_A1`, open defect below; `sm70/tests/server/probe_a1.py`
+  with the KV pool forced to 5 blocks). The record was preempted 55 times; its answer equals the record run
+  alone, max |Δp| 0.0001.
+* **Clef records of 34,816 tokens** (`FA2SM70_CLEF_NMAX=34816`, production still 32,768): `proverka_stenda.py
+  dlinnye 34816` 50/50 including a fact at 95 % of a 34,816-token record; head against PyTorch fp32 at
+  N = 34,816: max |Δlogit| 6.79e-4, max |Δp| 7.0e-5, argmax 8/8 (`proverka_golovy.py`, now sized with
+  `Nmax = max(16384, N)`); +160 MiB on rank 0.
+* The stand then served real traffic with all of the above enabled: Clef equal to the reference (158 values,
+  max |Δ| 0), needle at 60K found, mixed Clef + chat load all correct, MTP acceptance 2.33.
+
 ### Open defects (fuzzing, 2026-10-14)
 
 CPU fuzzers driving the real code found defects that do not crash but change results silently. The
@@ -227,9 +266,11 @@ MTP acceptance, needle ladder, Clef parity.
   * The runner keeps the request, so `req_begin` is not called again.
   * `span_add_k` then accumulates the already processed positions a second time.
   * Fix: track the expected next position per slot and restart the record when it does not match.
+    Behind `FA2SM70_CLEF_A1`, verified on the stand 2026-10-18 (above); not yet in production.
 * **Padded rows of the MTP drafter batch** (`eagle.py`, `_дополнить_мету`). When the number of real rows
   shrinks for the same padded size, the padded rows keep the previous step's sequence lengths and slots,
-  and the draft layer writes K/V into other requests' slots.
+  and the draft layer writes K/V into other requests' slots. Fix behind `FA2SM70_PAD_META_FIX`, verified on
+  the stand 2026-10-18 (above); not yet in production.
 * **Configuration limit.** The sparse decode selection supports at most 4096 key blocks per row. With
   `FA2SM70_SPARSE_B=64` that is exactly a 262,144-token table.
 * Ruled out by the same fuzzers: the encoder scheduling for the drafter (900,000 cases, 0 violations in
@@ -253,5 +294,19 @@ MTP acceptance, needle ladder, Clef parity.
   Clef's 290 MiB on rank 0 leaves too little headroom: mixed Clef + chat load ran out of memory in
   `qwen3_dflash._project_context_kv`. Shrink Clef (fewer ring slots, `FA2SM70_CLEF_R=1`) before
   combining them.
+* **Preemption thrash in an overcommitted pool.** vLLM admits a waiting request when its first chunk fits,
+  without checking that the whole prompt will. With the pool forced to 5 blocks, a 24K Clef record next to
+  a decoding chat was admitted, could not grow, was preempted and recomputed 55 times in a row; for 17 min
+  the chat decoded at ~1.3 tokens/s instead of ~25 (answers stayed correct). With the production pool of
+  262,144 tokens this needs the concurrent contexts to exceed the pool.
+* **NCCL P2P over a PCIe pair can hang at start.** On GPU0-1 (PHB) the server hung several times at NCCL
+  P2P connection setup when started seconds after the previous process left the cards; a bare NCCL test
+  hung at the same time and passed minutes later. A 60 s pause did not cure it, `NCCL_P2P_DISABLE=1` did.
+  The price is prefill: ~820 tokens/s flat from 1K to 64K on that pair (the launcher's own measurement of
+  2026-08-21 credits P2P over PCIe with ×1.52 prefill). Decode 51-62 tokens/s, following MTP acceptance.
+* **Start the server from a neutral directory.** The kernel warm-up runs `python -u -` with a here-document,
+  which puts the current directory first in `sys.path`. Started from a directory that holds another
+  `fa2_sm70` tree, the warm-up builds that tree into `FA2SM70_BUILD_DIR`, and the workers rebuild it back
+  (+30 min at start). Two different command hashes in a row in `.ninja_log` give it away.
 * **Thermal state matters.** On hot cards the 250K prefill varies between ~187 s and ~240 s. Read
   clocks (`nvidia-smi --query-gpu=clocks.sm,temperature.gpu`) next to every timing.

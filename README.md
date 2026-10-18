@@ -236,7 +236,12 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
      released, in Python (`FA2SM70_KEEP_BUFS`) and in the kernels (`sparse_select.cu`, `w8a16_gemv.cu`); draft
      token ids are range-checked before scheduling (`FA2SM70_DRAFT_GUARD`);
    * 2026-10-18: a prefill chunk of exactly k+1 = 4 tokens is no longer taken for a uniform speculative
-     decode step and replayed through the full graph on stale GDN state (`FA2SM70_UNIFORM_PREFILL_FIX`).
+     decode step and replayed through the full graph on stale GDN state (`FA2SM70_UNIFORM_PREFILL_FIX`);
+   * 2026-10-18, verified on a test pair and behind levers that are still `0` in production: sparse-decode
+     mean keys refreshed for every request of a decode batch (`FA2SM70_BLKMEAN_ALL`), placeholder slots for
+     padded drafter rows (`FA2SM70_PAD_META_FIX`), prefix-cache retention under Clef load
+     (`FA2SM70_FREE_UNHASHED_HEAD`, `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1`), Clef records restarted after
+     preemption (`FA2SM70_CLEF_A1`).
 
 `git log 437b358e5..sm70` shows each step with a description.
 
@@ -255,10 +260,19 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
   Clef's probabilities. This checkpoint ships the fast Qwen2-VL image processor while Clef uses the slow
   one: image token counts are identical, pixel values may differ slightly. Videos are not supported in
   `/v1/systemone`.
-* Open defects found by fuzzing on 2026-10-14 and not yet fixed in production (VALIDATION.md, "Open
-  defects"): with shared GDN buffers the full decode graph reads a stale accepted-token count in 9 of 10
-  GDN groups; a Clef record preempted mid-prefill accumulates its span means twice; padded rows of the
-  drafter batch can write draft K/V into other requests' slots.
+* Open in production (VALIDATION.md):
+  * with shared GDN buffers the full decode graph reads a stale accepted-token count in 9 of 10 GDN groups
+    (fuzzing, 2026-10-14);
+  * sparse decode keeps stale mean keys for every request but the first of a decode batch. In parallel chats
+    beyond 16K tokens the model can misremember what it wrote itself more than 512 tokens earlier
+    (2026-10-18);
+  * a Clef record preempted mid-prefill accumulates its span means twice; padded drafter rows can write
+    draft K/V into other requests' slots (fuzzing, 2026-10-14).
+  
+  The last three are fixed on a test pair behind levers that are still `0` in production
+  (`FA2SM70_BLKMEAN_ALL`, `FA2SM70_CLEF_A1`, `FA2SM70_PAD_META_FIX`; LEVERS.md, **stand**).
+* When the concurrent contexts exceed the KV pool, preemption with recompute can thrash: a request is
+  admitted, cannot grow, is preempted and recomputed again and again (VALIDATION.md, "Known effects").
 * The sparse decode selection supports at most 4096 key blocks: with `FA2SM70_SPARSE_B=64` that is a
   262,144-token table. A larger `max_model_len` or a smaller block fails at the first long decode.
 

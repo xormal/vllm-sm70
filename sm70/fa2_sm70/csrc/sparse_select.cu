@@ -1,3 +1,4 @@
+#include <cstdlib>
 // [FA2/SM70] ЭТАП 1 РАЗРЕЖЕННОГО ПРЕФИЛЛА: средние ключи -> счёт -> отбор -> CSR-индекс.
 // Записка 20. Правило -- FlashPrefill V2 §3.1 (arXiv 2608.19758), но БЕЗ поправки на среднее:
 // на нашей сети она замерена и в рабочем диапазоне 20-45 % оставленных блоков ВРЕДИТ
@@ -124,15 +125,26 @@ __global__ void blk_mean_update(
         const int8_t* __restrict__ K, const float* __restrict__ Ks,
         const long* __restrict__ slots, int nslots, int bs, int Hkv, int D, int B,
         long pstride, __half* __restrict__ out, int subPerPage,
-        __half* __restrict__ devOut) {
+        __half* __restrict__ devOut, int allSub) {
     const int grp = blockIdx.x, hk = blockIdx.y, d = threadIdx.x;
     if (d >= D) return;
     const int s0 = grp * B, s1 = min(s0 + B, nslots);
     if (s0 >= s1) return;
-    long first = -1;
-    for (int i = s0; i < s1; ++i) { if (slots[i] >= 0) { first = slots[i]; break; } }
-    if (first < 0) return;
-    const long pg = first / bs, intra = first - pg * bs, sub = intra / B;
+    // [18.10] ВСЕ ПОДБЛОКИ СРЕЗА (allSub=1). Срез из B слотов -- это не обязательно один подблок:
+    // в декоде запрос даёт k+1 = 4 слота, и в срез из 64 попадают до 16 запросов. Прежде
+    // пересчитывался только подблок ПЕРВОГО слота, а у остальных подблоки, дописанные декодом,
+    // оставались со старыми средними (у нового подблока -- нулями): отбор разреженного декода
+    // видел их пустыми, как только они выходили из окна недавних. Повторный пересчёт того же
+    // подблока другим срезом идемпотентен (пишет то же самое).
+    long prevKey = -1;
+    for (int i = s0; i < s1; ++i) {
+    const long slot = slots[i];
+    if (slot < 0) continue;
+    const long pg = slot / bs, intra = slot - pg * bs, sub = intra / B;
+    const long key = pg * subPerPage + sub;
+    if (key == prevKey) continue;
+    if (prevKey >= 0 && !allSub) break;
+    prevKey = key;
     // [СЧИТАЕМ ВЕСЬ ПОДБЛОК, А НЕ ТОЛЬКО СЛОТЫ ГРУППЫ]
     // Первая редакция усредняла лишь те слоты группы, что попали в этот подблок. Это верно
     // РОВНО когда чанк начинается на границе подблока -- а в приборе слоты шли `arange(T)`,
@@ -157,6 +169,7 @@ __global__ void blk_mean_update(
     if (devOut != nullptr)
         devOut[((pg * subPerPage + sub) * Hkv + hk) * D + d] =
             __float2half(fmaxf(vmax - mu, mu - vmin));
+    }
 }
 
 // ---- K1c: собрать средние логических блоков из ФИЗИЧЕСКОЙ таблицы по таблице блоков.
@@ -750,6 +763,17 @@ __global__ void select_csr_rows(
 
 // Обновить таблицу средних ключей ПО ТРОНУТЫМ подблокам. Зовётся ПОСЛЕ записи KV.
 // Форма таблицы: [страниц * (bs/B), Hkv, D] fp16. Создаётся вызывающим один раз на слой.
+// Рычаг FA2SM70_BLKMEAN_ALL (один раз на процесс): 1 = пересчитывать все подблоки среза.
+static int _blkmean_all() {
+    static const int v = [] {
+        const char* e = std::getenv("FA2SM70_BLKMEAN_ALL");
+        const int r = (e != nullptr && e[0] == '1') ? 1 : 0;
+        if (r) std::fprintf(stderr, "[fa2_sm70 18.10] BLKMEAN_ALL=1 (blk_mean_update: все подблоки среза)\n");
+        return r;
+    }();
+    return v;
+}
+
 void fa2sm70_blk_mean_update(torch::Tensor Kc, torch::Tensor Kst, torch::Tensor slot_mapping,
                              torch::Tensor kbarPool, int64_t B,
                              c10::optional<torch::Tensor> devPool = c10::nullopt) {
@@ -769,7 +793,8 @@ void fa2sm70_blk_mean_update(torch::Tensor Kc, torch::Tensor Kst, torch::Tensor 
         n, bs, Hkv, D, (int)B, (long)Kc.stride(0),
         reinterpret_cast<__half*>(kbarPool.data_ptr<at::Half>()), subPerPage,
         (devPool.has_value() && devPool->defined())
-            ? reinterpret_cast<__half*>(devPool->data_ptr<at::Half>()) : nullptr);
+            ? reinterpret_cast<__half*>(devPool->data_ptr<at::Half>()) : nullptr,
+        _blkmean_all());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

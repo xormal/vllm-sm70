@@ -13,6 +13,12 @@ from vllm.distributed.kv_events import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core import fa2sm70_tail
+import os as _os_f1
+
+# [18.10] F1: освобождённые блоки без хэша -- в голову очереди свободных. Умолчание 0.
+_FREE_UNHASHED_HEAD = _os_f1.environ.get("FA2SM70_FREE_UNHASHED_HEAD", "0") == "1"
+if _FREE_UNHASHED_HEAD:
+    print(f"[fa2_sm70 18.10] FREE_UNHASHED_HEAD=1 ({__file__})", flush=True)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -432,6 +438,14 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+        if _FREE_UNHASHED_HEAD:
+            # [18.10, F1 разбора префикс-кэша 15.10] Блок БЕЗ хэша никому не нужен -- в голову
+            # очереди (возьмут первым); хэшированный -- в хвост (проживёт дольше). Раньше все шли в
+            # хвост, и приём заявок Clef съедал рано отпущенные хэшированные блоки GDN раньше пустых.
+            сво = [b for b in blocks_list if b.ref_cnt == 0 and not b.is_null]
+            self.free_block_queue.prepend_n([b for b in сво if b.block_hash is None])
+            self.free_block_queue.append_n([b for b in сво if b.block_hash is not None])
+            return
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
