@@ -19,7 +19,7 @@ Model weights and Clef adapters: **[alexxorm/Qwen3.8-27B-ABLITERATED-GPTQ-Int8-C
 | **Hardware** | 2× NVIDIA V100 32 GB, tensor parallel 2, NVLink or PCIe |
 | **Context** | 262,144 tokens, int8 KV cache |
 | **Modalities** | text, images, video, tool calls (OpenAI-compatible API) |
-| **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, records up to 32,768 tokens with images, +0.35 / +0.12 GB of GPU memory |
+| **Decisions** | `POST /v1/systemone`: Clef (Jev/SystemOne API) on the same weights, records up to 34,816 tokens with images, +514 / +121 MiB of GPU memory |
 | **Speculation** | native MTP head, k = 3, with n-gram assist |
 
 ---
@@ -56,6 +56,31 @@ with its own kernels and integration:
 | Load | 10 Clef records + 6 chats concurrently, and 8 × 2-image storms followed by a 243K prompt: no failures |
 
 Details, tools and known effects: [docs/sm70/VALIDATION.md](docs/sm70/VALIDATION.md).
+
+## Production load
+
+Wall-clock production traffic on two servers running this code, not a synthetic benchmark:
+chat/completions plus Clef decisions on the same resident weights. The window runs from the start after a
+host reboot to 2026-10-24 23:42 (+04). Counters are vLLM's `/metrics`.
+
+| | NVLink TP2 (production pair) | PCIe TP2 (test pair, P2P off) | Total |
+|---|---|---|---|
+| Window | 40.07 h | 39.83 h | |
+| Input tokens | 166,023,160 | 106,370,942 | **272,394,102** |
+| Output tokens | 5,307,565 | 2,557,227 | **7,864,792** |
+| Clef requests | 106,609 | 44,355 | **150,964** |
+| Chat requests | 2,272 | 4,026 | **6,298** |
+| Average input / output, wall clock | 1150.9 / 36.79 tok/s | 741.9 / 17.83 tok/s | |
+| Failed requests, preemptions | 0, 0 | 0, 0 | |
+| MTP mean acceptance length (k = 3) | 3.83 | 3.58 | |
+
+Notes:
+
+* Traffic was routed by the operator, so the averages are delivered load, not capacity.
+* Clef records count one engine token each toward output, and the input includes Clef.
+* Full report: [docs/qwen38-27b-sm70-performance.md](docs/qwen38-27b-sm70-performance.md). It covers the
+  quantization, the dual workload, correctness, determinism, the hot path and reproducibility.
+* Records and comparison contract: [BENCHMARKING.md](BENCHMARKING.md).
 
 ## Requirements
 
@@ -102,7 +127,7 @@ CARDS=0,1 PORT=8000 scripts/serve_qwen38_clef.sh
 ```
 
 [`scripts/serve_qwen38_clef.sh`](scripts/serve_qwen38_clef.sh) reproduces the production server exactly:
-it loads the 108 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
+it loads the 114 levers of [`configs/qwen38-27b-int8-clef.env`](configs/qwen38-27b-int8-clef.env), probes the
 toolchain, chooses fp16 or int12 all-reduce from the NVLink topology, refuses busy GPUs or ports, builds
 all kernels in one process, and starts the OpenAI-compatible server with the production arguments. The first
 start compiles the kernels (15–30 min) and repacks the attention weights to W12. Both are cached in
@@ -116,7 +141,7 @@ start compiles the kernels (15–30 min) and repacks the attention weights to W1
 | `SERVED_NAMES` | `Qwen3.8-27B-ABLITERATED` | model names in the API |
 | `THINK` | `false` | default `enable_thinking` (per-request override allowed) |
 | `FA2SM70_CLEF` | `1` | `0` serves the base model only |
-| `FA2SM70_CLEF_NMAX`, `FA2SM70_CLEF_MEDIA` | `32768`, `1` | Clef record limit in tokens; images in Clef records (`0` rejects them) |
+| `FA2SM70_CLEF_NMAX`, `FA2SM70_CLEF_MEDIA` | `34816`, `1` | Clef record limit in tokens; images in Clef records (`0` rejects them) |
 | `STATE_DIR`, `PY`, `CUDA_HOME` | see script | cache directory, Python, toolkit |
 | `DRYRUN=1` | | print the resolved environment and command without starting |
 
@@ -168,10 +193,10 @@ curl http://localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '
 
 * **Question types:** `choice` (dict of options → `choice`, `probabilities`), `score` (ordered list →
   expected `score`, `probabilities`), `noul` (→ probability of "yes"). `state` is a string or any JSON value.
-* **Limits:** 32,768 tokens per record, images included (`FA2SM70_CLEF_NMAX`; Clef's own default
+* **Limits:** 34,816 tokens per record, images included (`FA2SM70_CLEF_NMAX`; Clef's own default
   `max_length` is 16,384, lower it per request with `"max_length"`), up to 16 images per record, 64
-  questions, 448 options in total, 256 options per question. Videos are rejected with 400. Two records are
-  processed concurrently and further ones wait.
+  questions, 448 options in total, 256 options per question. Videos are rejected with 400. Four records are
+  processed concurrently (`FA2SM70_CLEF_R`) and further ones wait.
 * **Images** are encoded as in Clef's `encode_record`: the image tokens follow `STATE:\n`. Clef's vision
   encoder is bitwise identical to this checkpoint's (333/333 tensors), so the served encoder is reused as is.
   Images are fetched like in chat (same media connector, same domain and path restrictions). The worker
@@ -237,11 +262,11 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
      token ids are range-checked before scheduling (`FA2SM70_DRAFT_GUARD`);
    * 2026-10-18: a prefill chunk of exactly k+1 = 4 tokens is no longer taken for a uniform speculative
      decode step and replayed through the full graph on stale GDN state (`FA2SM70_UNIFORM_PREFILL_FIX`);
-   * 2026-10-18, verified on a test pair and behind levers that are still `0` in production: sparse-decode
+   * 2026-10-18, verified on a test pair, in production since 2026-10-19: sparse-decode
      mean keys refreshed for every request of a decode batch (`FA2SM70_BLKMEAN_ALL`), placeholder slots for
      padded drafter rows (`FA2SM70_PAD_META_FIX`), prefix-cache retention under Clef load
      (`FA2SM70_FREE_UNHASHED_HEAD`, `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1`), Clef records restarted after
-     preemption (`FA2SM70_CLEF_A1`);
+     preemption (`FA2SM70_CLEF_A1`), Clef records of 34,816 tokens with 4 slots;
    * 2026-10-16: an optional host-RAM KV offload connector, a second prefix-cache tier that survives GDN block
      eviction under Clef load (`FA2SM70_KV_OFFLOAD`, off in production).
 
@@ -249,30 +274,29 @@ The `sm70` branch starts at 1Cat-vLLM `437b358e5` and adds, in order:
 
 ## Known limitations
 
-* Volta only. Other architectures are untested, and some paths assume `sm_70`.
+* Volta only. Other architectures are untested, and some paths assume `sm_70`. On A100 the `m8n8k4` tensor
+  instructions of the kernels run emulated, about 6× slower than on V100; a port is needed
+  ([report](docs/qwen38-27b-sm70-performance.md), section 4).
 * `/v1/completions` with `echo` and `logprobs` on long prompts allocates full-vocabulary logits per
   prompt chunk (1.89 GiB per rank) and can exhaust memory. Do not expose prompt logprobs to untrusted
   clients.
 * With speculation, decode logprobs depend at the ~1e-3 level on the GPU memory layout at startup
   (see VALIDATION.md). Bitwise comparisons are only meaningful between identical configurations.
-* Clef records go up to 32,768 tokens. The native head is verified against PyTorch fp32 at 32,768 and a
-  fact-retrieval test passes 40/40 up to 32K, but Cloudflare did not evaluate Clef beyond its own 16,384
+* Clef records go up to 34,816 tokens. The native head is verified against PyTorch fp32 at 32,768 and
+  34,816, and a fact-retrieval test passes 50/50 up to 34,816 tokens, but Cloudflare did not evaluate Clef beyond its own 16,384
   default.
 * Clef with images is checked on known-answer records and for determinism, not yet against the original
   Clef's probabilities. This checkpoint ships the fast Qwen2-VL image processor while Clef uses the slow
   one: image token counts are identical, pixel values may differ slightly. Videos are not supported in
   `/v1/systemone`.
-* Open in production (VALIDATION.md):
-  * with shared GDN buffers the full decode graph reads a stale accepted-token count in 9 of 10 GDN groups
-    (fuzzing, 2026-10-14);
-  * sparse decode keeps stale mean keys for every request but the first of a decode batch. In parallel chats
-    beyond 16K tokens the model can misremember what it wrote itself more than 512 tokens earlier
-    (2026-10-18);
-  * a Clef record preempted mid-prefill accumulates its span means twice; padded drafter rows can write
-    draft K/V into other requests' slots (fuzzing, 2026-10-14).
-  
-  The last three are fixed on a test pair behind levers that are still `0` in production
-  (`FA2SM70_BLKMEAN_ALL`, `FA2SM70_CLEF_A1`, `FA2SM70_PAD_META_FIX`; LEVERS.md, **stand**).
+* Open defects (VALIDATION.md):
+  * with shared GDN buffers the full decode graph reads a stale accepted-token count in GDN groups 1..9
+    (fuzzing, 2026-10-14). Production builds a single GDN group, so it is not affected; other block layouts
+    can be.
+  * Fixed in production on 2026-10-19:
+    * stale sparse-decode mean keys for every request but the first of a decode batch;
+    * Clef span means accumulated twice after preemption;
+    * padded drafter rows writing K/V into other requests' slots.
 * When the concurrent contexts exceed the KV pool, preemption with recompute can thrash: a request is
   admitted, cannot grow, is preempted and recomputed again and again (VALIDATION.md, "Known effects").
 * The sparse decode selection supports at most 4096 key blocks: with `FA2SM70_SPARSE_B=64` that is a

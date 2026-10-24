@@ -209,7 +209,7 @@ Found by the 2026-10-14 fuzzers, reproduced and fixed on a test pair of GPUs, in
   0.16) is the server's own repeat noise. Controls 2051 and 2053 (last chunk 3 and 5 tokens) unchanged.
   Base logprobs bitwise identical to the unpatched server, Clef 70/70 with max |Δp| 0.
 
-### Stand 2026-10-18: fixes verified, not yet in production
+### Stand 2026-10-18: fixes verified (in production since 2026-10-19)
 
 A test pair of GPUs (GPU0-1, PCIe, `NCCL_P2P_DISABLE=1`) ran the production stack with a vLLM copy, so the
 production venv stayed untouched. Every fix is a lever with default `0` (LEVERS.md, marked **stand**).
@@ -241,12 +241,29 @@ production venv stayed untouched. Every fix is a lever with default `0` (LEVERS.
 * **Clef record preempted mid-prefill** (`FA2SM70_CLEF_A1`, open defect below; `sm70/tests/server/probe_a1.py`
   with the KV pool forced to 5 blocks). The record was preempted 55 times; its answer equals the record run
   alone, max |Δp| 0.0001.
-* **Clef records of 34,816 tokens** (`FA2SM70_CLEF_NMAX=34816`, production still 32,768): `proverka_stenda.py
+* **Clef records of 34,816 tokens** (`FA2SM70_CLEF_NMAX=34816`, in production since 2026-10-19): `proverka_stenda.py
   dlinnye 34816` 50/50 including a fact at 95 % of a 34,816-token record; head against PyTorch fp32 at
   N = 34,816: max |Δlogit| 6.79e-4, max |Δp| 7.0e-5, argmax 8/8 (`proverka_golovy.py`, now sized with
   `Nmax = max(16384, N)`); +160 MiB on rank 0.
 * The stand then served real traffic with all of the above enabled: Clef equal to the reference (158 values,
   max |Δ| 0), needle at 60K found, mixed Clef + chat load all correct, MTP acceptance 2.33.
+
+### Deployment 2026-10-19: the stand fixes in production
+
+`FA2SM70_BLKMEAN_ALL=1`, `FA2SM70_PAD_META_FIX=1`, `FA2SM70_FREE_UNHASHED_HEAD=1`, `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1=1`,
+`FA2SM70_CLEF_A1=1`, `FA2SM70_CLEF_NMAX=34816`, `FA2SM70_CLEF_R=4` (now in `configs/qwen38-27b-int8-clef.env`).
+Production restarted 2026-10-19 02:40, ready 02:44, no kernel rebuild at startup (the prefill kernel with the
+`blk_mean_update` fix was prebuilt into a new build directory with the GPUs hidden).
+
+* Levers confirmed from the startup log of every worker; KV capacity 262,144 tokens; free GPU memory
+  898 / 1182 MiB.
+* Clef 34K (`dlinnye 34816`) 50/50; recall (`probe_recall.py`) 4/4.
+* Clef against the stand with the same fixes: max |Δp| 0.0227, 34/35; the flip is record 9, a tie of six
+  options (stand 0.1984 against 0.1959). The stand service with the fixes equals the stand reference to
+  0.0000 on all 10 records, i.e. the fixes do not change Clef numbers. Production differs from the stand
+  already on short records (0.0013 on 369 tokens): the all-reduce summation order differs between NVLink
+  and host-staged PCIe.
+* Load since then: [docs/qwen38-27b-sm70-performance.md](../qwen38-27b-sm70-performance.md), section 3.
 
 ### Host-RAM KV offload (2026-10-16 … 10-18, off in production)
 
@@ -282,15 +299,18 @@ MTP acceptance, needle ladder, Clef parity.
     wrong position.
   * The GRAN_SRC/DST state-block-boundary substitutions are also applied to group 0 only.
   * Fix: share the buffer, and rebuild groups 1..9 on boundary steps. Fuzzer mismatches go to 0.
+  * **Does not apply to the production layout.** Production builds a single GDN group: the startup log
+    `[fa2_sm70 ГРУППЫ]` shows group 0 = `GDNAttentionMetadataBuilder` with all 48 layers and group 1 = the
+    17 attention layers (16 + MTP). The defect needs GDN groups 1..9, which other block layouts produce.
 * **Clef record preempted mid-prefill.**
   * The runner keeps the request, so `req_begin` is not called again.
   * `span_add_k` then accumulates the already processed positions a second time.
   * Fix: track the expected next position per slot and restart the record when it does not match.
-    Behind `FA2SM70_CLEF_A1`, verified on the stand 2026-10-18 (above); not yet in production.
+    Behind `FA2SM70_CLEF_A1`, verified on the stand 2026-10-18 (above); in production since 2026-10-19.
 * **Padded rows of the MTP drafter batch** (`eagle.py`, `_дополнить_мету`). When the number of real rows
   shrinks for the same padded size, the padded rows keep the previous step's sequence lengths and slots,
   and the draft layer writes K/V into other requests' slots. Fix behind `FA2SM70_PAD_META_FIX`, verified on
-  the stand 2026-10-18 (above); not yet in production.
+  the stand 2026-10-18 (above); in production since 2026-10-19.
 * **Configuration limit.** The sparse decode selection supports at most 4096 key blocks per row. With
   `FA2SM70_SPARSE_B=64` that is exactly a 262,144-token table.
 * Ruled out by the same fuzzers: the encoder scheduling for the drafter (900,000 cases, 0 violations in

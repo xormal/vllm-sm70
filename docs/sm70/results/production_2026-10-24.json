@@ -1,0 +1,202 @@
+{
+ "records": [
+  {
+   "schema_version": 1,
+   "id": "prod-v100-nvlink-tp2-2026-10-24",
+   "kind": "production_traffic",
+   "date": "2026-10-24",
+   "hardware": {
+    "gpu_model": "Tesla V100-SXM2-32GB",
+    "gpu_count": 2,
+    "gpu_indices": [
+     2,
+     3
+    ],
+    "topology": "NVLink (NV2)",
+    "p2p": true,
+    "clocks": {
+     "locked": false,
+     "application_mhz": 1290,
+     "max_mhz": 1530
+    },
+    "driver": "580.159.03"
+   },
+   "software": {
+    "cuda": "12.8",
+    "torch": "2.9.1+cu128",
+    "python": "3.12.10",
+    "commit": "8a59d8fb81420a865c5dd9d6a2cb77ac0e0351a0",
+    "lever_file": "configs/qwen38-27b-int8-clef.env",
+    "lever_overrides": {
+     "FA2SM70_BLKMEAN_ALL": "1",
+     "FA2SM70_PAD_META_FIX": "1",
+     "FA2SM70_FREE_UNHASHED_HEAD": "1",
+     "FA2SM70_NO_SPEC_BLOCKS_MAXTOK1": "1",
+     "FA2SM70_CLEF_A1": "1",
+     "FA2SM70_CLEF_NMAX": "34816",
+     "FA2SM70_CLEF_R": "4"
+    },
+    "extra_env": {},
+    "note": "lever_file at commit 8a59d8fb8 plus lever_overrides (enabled in production 2026-10-19); identical to the lever file of the commit that adds this record"
+   },
+   "model": {
+    "name": "Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef",
+    "weights": "GPTQ int8 g128 + W12 q/k/v + int8 lm_head/MTP",
+    "kv_dtype": "int8",
+    "max_model_len": 262144
+   },
+   "workload": {
+    "description": "wall-clock production traffic: chat/completions and Clef /v1/systemone records; not synthetic",
+    "prompt_tokens": null,
+    "output_tokens": null,
+    "concurrency": "live traffic",
+    "prefix_cache": "enabled, warm (live)",
+    "speculation": "MTP k=3 + n-gram assist"
+   },
+   "method": {
+    "warmup": 0,
+    "runs": 1,
+    "window": {
+     "start": "2026-10-23T07:38:13+04:00",
+     "end": "2026-10-24T23:42:29+04:00",
+     "seconds": 144256
+    },
+    "source": "vLLM /metrics counters since server start"
+   },
+   "results": {
+    "input_tokens": 166023160,
+    "output_tokens": 5307565,
+    "clef_requests": 106609,
+    "chat_requests": 2272,
+    "chat_output_tokens": 5200956,
+    "avg_input_tok_s": 1150.9,
+    "avg_output_tok_s": 36.79,
+    "failed_requests": 0,
+    "preemptions": 0,
+    "mtp_mean_acceptance_length": 3.829,
+    "prefix_cache_hit_rate": 0.0014
+   },
+   "raw_counters": {
+    "prompt_tokens_total": 166023160,
+    "generation_tokens_total": 5307565,
+    "requests_max_tokens_1": 106609,
+    "requests_total": 108881,
+    "request_success_stop": 2190,
+    "request_success_length": 106691,
+    "request_success_abort": 0,
+    "request_success_error": 0,
+    "num_preemptions_total": 0,
+    "prefix_cache_queries_total": 734995045,
+    "prefix_cache_hits_total": 1015808,
+    "spec_decode_num_drafts_total": 1358608,
+    "spec_decode_num_draft_tokens_total": 4075824,
+    "spec_decode_num_accepted_tokens_total": 3842919,
+    "spec_decode_num_accepted_tokens_per_pos_total": [
+     1324834,
+     1282713,
+     1235372
+    ]
+   }
+  },
+  {
+   "schema_version": 1,
+   "id": "prod-v100-pcie-tp2-2026-10-24",
+   "kind": "production_traffic",
+   "date": "2026-10-24",
+   "hardware": {
+    "gpu_model": "Tesla V100-SXM2-32GB",
+    "gpu_count": 2,
+    "gpu_indices": [
+     0,
+     1
+    ],
+    "topology": "PCIe host bridge (PHB)",
+    "p2p": false,
+    "clocks": {
+     "locked": false,
+     "application_mhz": 1290,
+     "max_mhz": 1530
+    },
+    "driver": "580.159.03"
+   },
+   "software": {
+    "cuda": "12.8",
+    "torch": "2.9.1+cu128",
+    "python": "3.12.10",
+    "commit": "8a59d8fb81420a865c5dd9d6a2cb77ac0e0351a0",
+    "lever_file": "configs/qwen38-27b-int8-clef.env",
+    "lever_overrides": {
+     "FA2SM70_BLKMEAN_ALL": "1",
+     "FA2SM70_PAD_META_FIX": "1",
+     "FA2SM70_FREE_UNHASHED_HEAD": "1",
+     "FA2SM70_NO_SPEC_BLOCKS_MAXTOK1": "1",
+     "FA2SM70_CLEF_A1": "1",
+     "FA2SM70_CLEF_NMAX": "34816",
+     "FA2SM70_CLEF_R": "4"
+    },
+    "extra_env": {
+     "NCCL_P2P_DISABLE": "1"
+    },
+    "note": "lever_file at commit 8a59d8fb8 plus lever_overrides (enabled in production 2026-10-19); identical to the lever file of the commit that adds this record"
+   },
+   "model": {
+    "name": "Qwen3.8-27B-ABLITERATED-GPTQ-Int8-Clef",
+    "weights": "GPTQ int8 g128 + W12 q/k/v + int8 lm_head/MTP",
+    "kv_dtype": "int8",
+    "max_model_len": 262144
+   },
+   "workload": {
+    "description": "wall-clock production traffic: chat/completions and Clef /v1/systemone records; not synthetic",
+    "prompt_tokens": null,
+    "output_tokens": null,
+    "concurrency": "live traffic",
+    "prefix_cache": "enabled, warm (live)",
+    "speculation": "MTP k=3 + n-gram assist"
+   },
+   "method": {
+    "warmup": 0,
+    "runs": 1,
+    "window": {
+     "start": "2026-10-23T07:52:45+04:00",
+     "end": "2026-10-24T23:42:29+04:00",
+     "seconds": 143384
+    },
+    "source": "vLLM /metrics counters since server start"
+   },
+   "results": {
+    "input_tokens": 106370942,
+    "output_tokens": 2557227,
+    "clef_requests": 44355,
+    "chat_requests": 4026,
+    "chat_output_tokens": 2512872,
+    "avg_input_tok_s": 741.9,
+    "avg_output_tok_s": 17.83,
+    "failed_requests": 0,
+    "preemptions": 0,
+    "mtp_mean_acceptance_length": 3.575,
+    "prefix_cache_hit_rate": 0.4227
+   },
+   "raw_counters": {
+    "prompt_tokens_total": 106370942,
+    "generation_tokens_total": 2557227,
+    "requests_max_tokens_1": 44355,
+    "requests_total": 48381,
+    "request_success_stop": 4024,
+    "request_success_length": 44357,
+    "request_success_abort": 0,
+    "request_success_error": 0,
+    "num_preemptions_total": 0,
+    "prefix_cache_queries_total": 38795134,
+    "prefix_cache_hits_total": 16400384,
+    "spec_decode_num_drafts_total": 703179,
+    "spec_decode_num_draft_tokens_total": 2109537,
+    "spec_decode_num_accepted_tokens_total": 1810436,
+    "spec_decode_num_accepted_tokens_per_pos_total": [
+     651042,
+     600700,
+     558694
+    ]
+   }
+  }
+ ]
+}

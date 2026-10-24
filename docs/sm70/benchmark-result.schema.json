@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xormal/vllm-sm70/docs/sm70/benchmark-result.schema.json",
+  "title": "vllm-sm70 benchmark results file",
+  "type": "object",
+  "required": ["records"],
+  "properties": {
+    "records": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/record"}}
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "required": ["schema_version", "id", "kind", "date", "hardware", "software", "model", "workload", "method", "results"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+        "kind": {"enum": ["prefill", "decode", "clef", "mixed", "production_traffic", "accuracy"]},
+        "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "baseline": {"type": "string", "description": "id of the record this one is compared against"},
+        "hardware": {
+          "type": "object",
+          "required": ["gpu_model", "gpu_count", "topology", "p2p", "clocks", "driver"],
+          "properties": {
+            "gpu_model": {"type": "string"},
+            "gpu_count": {"type": "integer", "minimum": 1},
+            "gpu_indices": {"type": "array", "items": {"type": "integer"}},
+            "topology": {"type": "string", "description": "NVLink (NVn) | PCIe switch (PIX/PXB) | PCIe host bridge (PHB) | SYS"},
+            "p2p": {"type": "boolean"},
+            "clocks": {
+              "type": "object",
+              "required": ["locked"],
+              "properties": {
+                "locked": {"type": "boolean"},
+                "locked_mhz": {"type": "integer"},
+                "application_mhz": {"type": "integer"},
+                "max_mhz": {"type": "integer"},
+                "observed_sm_mhz": {"type": "array", "items": {"type": "integer"}},
+                "observed_temp_c": {"type": "array", "items": {"type": "number"}}
+              }
+            },
+            "driver": {"type": "string"}
+          }
+        },
+        "software": {
+          "type": "object",
+          "required": ["cuda", "torch", "commit", "lever_file"],
+          "properties": {
+            "cuda": {"type": "string"},
+            "torch": {"type": "string"},
+            "python": {"type": "string"},
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+            "lever_file": {"type": "string"},
+            "lever_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+            "extra_env": {"type": "object", "additionalProperties": {"type": "string"}},
+            "note": {"type": "string"}
+          }
+        },
+        "model": {
+          "type": "object",
+          "required": ["name", "weights", "kv_dtype"],
+          "properties": {
+            "name": {"type": "string"},
+            "weights": {"type": "string", "description": "e.g. GPTQ int8 g128 + W12 q/k/v; NVFP4; AWQ int4"},
+            "kv_dtype": {"type": "string"},
+            "max_model_len": {"type": "integer"}
+          }
+        },
+        "workload": {
+          "type": "object",
+          "required": ["description", "prompt_tokens", "output_tokens", "concurrency", "prefix_cache"],
+          "properties": {
+            "description": {"type": "string"},
+            "prompt_tokens": {"type": ["integer", "null"], "description": "exact prompt length; null only for production_traffic"},
+            "output_tokens": {"type": ["integer", "null"]},
+            "concurrency": {"type": ["integer", "string"]},
+            "prefix_cache": {"type": "string", "description": "disabled | enabled, cold | enabled, warm | enabled, warm (live)"},
+            "speculation": {"type": "string"},
+            "prompt_sha256": {"type": "string"}
+          }
+        },
+        "method": {
+          "type": "object",
+          "required": ["warmup", "runs", "source"],
+          "properties": {
+            "warmup": {"type": "integer", "minimum": 0},
+            "runs": {"type": "integer", "minimum": 1},
+            "source": {"type": "string", "description": "tool or probe that produced the numbers, with arguments"},
+            "log": {"type": "string", "description": "path or URL of the raw log"},
+            "window": {"type": "object"}
+          }
+        },
+        "results": {
+          "type": "object",
+          "description": "metric name -> value; timed metrics carry *_median and *_best",
+          "additionalProperties": {"type": ["number", "integer", "string", "null"]}
+        },
+        "raw_counters": {"type": "object"}
+      }
+    }
+  }
+}

@@ -2,13 +2,14 @@
 
 The runtime is configured with environment variables ("levers"). They are read by the vLLM code
 under `vllm/` and the integration layer under `sm70/integrations/vllm_sm70/`. The production set,
-108 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
+114 levers with exact values, is [`configs/qwen38-27b-int8-clef.env`](../../configs/qwen38-27b-int8-clef.env).
 This page explains the ones that change the computation or the memory layout. All values below are the
 production values. Every default was chosen by measurement on 2× V100 32 GB, and the code next to each
 lever carries the measurement that justified it (search the name under `vllm/` and `sm70/`).
 
 Levers marked **stand** are fixes verified on a test pair of GPUs on 2026-10-18 (VALIDATION.md, "Stand
-2026-10-18") and not yet enabled in production. Their production value is `0`; each is a no-op at `0`.
+2026-10-18") and enabled in production on 2026-10-19 (VALIDATION.md, "Deployment 2026-10-19"). Their code
+default is `0`, which is a no-op.
 
 **Rule:** change one lever at a time, then re-run the gates in [VALIDATION.md](VALIDATION.md). Several
 levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` fingerprints those in
@@ -30,7 +31,7 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_SPARSE_MASS`, `FA2SM70_SPARSE_GAMMA`, `FA2SM70_SPARSE_BETA`, `FA2SM70_SPARSE_B` | `0.85`, `0.5`, `0`, `64` | Selection rule parameters (mass threshold, spread correction, block size) |
 | `FA2SM70_SPARSE_MINSQ` | `2048` | The last, partial query chunk stays dense (needle retention) |
 | `FA2SM70_SPARSE_DEC`, `FA2SM70_SPARSE_DEC_TOPF`, `FA2SM70_SPARSE_DEC_MINBLK` | `1`, `0.15`, `256` | Sparse decode: per-row/per-head top block fraction on long contexts; bit-identical to dense when all blocks are kept |
-| `FA2SM70_BLKMEAN_ALL` | `0` (**stand**: `1`) | Sparse decode: after a decode step `blk_mean_update` refreshes the mean keys of every sub-block in its 64-slot slice, not only the first one. With MTP a slice holds 4 slots of up to 16 requests; at `0` every request but the first in the batch keeps stale means for the sub-blocks decode wrote, and the selection drops them once they leave the 512-token recent window |
+| `FA2SM70_BLKMEAN_ALL` | `1` (**stand**, code default `0`) | Sparse decode: after a decode step `blk_mean_update` refreshes the mean keys of every sub-block in its 64-slot slice, not only the first one. With MTP a slice holds 4 slots of up to 16 requests; at `0` every request but the first in the batch keeps stale means for the sub-blocks decode wrote, and the selection drops them once they leave the 512-token recent window |
 
 ## Linear layers
 
@@ -57,7 +58,7 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_DRAFT_TM8` | `1` | Drafter linear layers on the turbomind int8 body |
 | `FA2SM70_GRAN_SRC`, `FA2SM70_GRAN_DST`, `FA2SM70_GRAN_CONV_ALL` | `1`, `1`, `0` | Block-granularity fixes for state copies under speculation |
 | `FA2SM70_UNIFORM_PREFILL_FIX` | `1` | A step counts as uniform speculative decode only if every row carries k draft tokens. Without it a prefill chunk of exactly k+1 = 4 tokens (one request, prompt length 2048·m + 4) replays the full speculative graph on stale GDN spec state, and the answer turns to garbage. See VALIDATION.md, 2026-10-18 |
-| `FA2SM70_PAD_META_FIX` | `0` (**stand**: `1`) | Padded rows of the drafter batch get the placeholder slot and length again when the number of real rows shrinks. At `0` they keep the previous call's real slots, and the draft layer writes K/V into them |
+| `FA2SM70_PAD_META_FIX` | `1` (**stand**, code default `0`) | Padded rows of the drafter batch get the placeholder slot and length again when the number of real rows shrinks. At `0` they keep the previous call's real slots, and the draft layer writes K/V into them |
 | `FA2SM70_PAD_META_PROBE` | unset | Diagnostics: every 2000 drafter calls, log how many padded rows carried a real slot |
 | `FA2SM70_ASYNC_SCHED` | `0` | Async scheduling off (required for MTP correctness at block boundaries) |
 | `FA2SM70_MTP` | `0` | Legacy switch of the old launcher. The MTP config is passed explicitly on the command line |
@@ -72,8 +73,8 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 | `FA2SM70_KEEP_BUFS` | `1` | Keep every attention buffer that is replaced when it grows (bit mask: 1 all, 2 per-layer fields, 4 module caches). Captured CUDA graphs keep writing to the old address; releasing it let replays corrupt whatever reused the memory. See VALIDATION.md, 2026-10-14 |
 | `FA2SM70_DRAFT_GUARD` | `1` | A draft token id outside [0, vocabulary) is dropped (that request runs the step without speculation) and logged with its hex value, row and request, instead of crashing the engine (`OverflowError` in `token_ids_cpu`) or reading out of bounds in the rejection sampler. Costs B×k integer comparisons per step |
 | `FA2SM70_SELBUF_PROBE` | `20000` | Probe for that defect: a retired selection buffer is filled with a sentinel and checked every N calls; `[SELBUF] ... ИЗМЕНЁН` in the log means a graph wrote to it. `0` disables the probe |
-| `FA2SM70_FREE_UNHASHED_HEAD` | `0` (**stand**: `1`) | Freed blocks without a hash go to the head of the free queue (taken first), hashed ones to the tail. At `0` everything goes to the tail, and admitting Clef records evicts the early-released hashed GDN blocks of the prefix cache before empty ones |
-| `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1` | `0` (**stand**: `1`) | Do not reserve the speculative GDN blocks for requests with `max_tokens=1` (Clef records): they never decode |
+| `FA2SM70_FREE_UNHASHED_HEAD` | `1` (**stand**, code default `0`) | Freed blocks without a hash go to the head of the free queue (taken first), hashed ones to the tail. At `0` everything goes to the tail, and admitting Clef records evicts the early-released hashed GDN blocks of the prefix cache before empty ones |
+| `FA2SM70_NO_SPEC_BLOCKS_MAXTOK1` | `1` (**stand**, code default `0`) | Do not reserve the speculative GDN blocks for requests with `max_tokens=1` (Clef records): they never decode |
 | `FA2SM70_KV_OFFLOAD`, `FA2SM70_KV_OFFLOAD_GB` | `0`, `16` | Host-RAM KV offload: a block of 16,384 tokens of all groups (attention K/V with both scale tables, the sparse-selection `_KBAR`/`_DEVP` rows, the GDN page and its int16 scales) is copied to pinned host memory when prefill completes it; a request whose prefix left the GPU pool gets it back by a copy (~0.05 s per block) instead of prefill. `_GB` is for the whole server: 16 → 24 slots, 393K tokens, 7.6 GiB pinned per rank. Off in production; the launcher adds `--kv-transfer-config` and `--no-disable-hybrid-kv-cache-manager` at `1` |
 | `FA2SM70_KV_OFFLOAD_TRACE`, `FA2SM70_KV_OFFLOAD_SYNC`, `FA2SM70_KV_OFFLOAD_LOG_S` | `0`, unset, unset | Diagnostics: a line per hit and write; copies on the main stream; period of the accounting line (60 s) |
 | `FA2SM70_W8_OOM_RETRY` | `1` | On an allocator OOM in a foreign GEMM body: empty the cache and retry once |
@@ -88,9 +89,9 @@ levers change the structure of compiled graphs. `scripts/serve_qwen38_clef.sh` f
 |---|---|---|
 | `FA2SM70_CLEF` | `1` | Enables `/v1/systemone`. `0` serves the base model with zero changes to its code path |
 | `FA2SM70_CLEF_DIR` | `<model>/clef` | Adapter directory (LoRA, de-abliteration, joint head) |
-| `FA2SM70_CLEF_R` | `2` | Concurrent Clef records (head slots) |
-| `FA2SM70_CLEF_NMAX` | `32768` | Maximum record length in tokens; a request's `max_length` can only lower it. Head memory is 2 KiB per token per slot: 32,768 costs +64 MiB on rank 0 over 16,384 (Clef's own default and the code default). The head is verified against a PyTorch fp32 reference at 32,768 |
-| `FA2SM70_CLEF_A1` | `0` (**stand**: `1`) | A record preempted mid-prefill and restarted from position 0 releases its head slot and is admitted again. At `0` its span means are accumulated twice |
+| `FA2SM70_CLEF_R` | `4` (code default `2`) | Concurrent Clef records (head slots); head memory is 2 KiB per token per slot, ~68 MiB per slot at 34,816 tokens on rank 0 |
+| `FA2SM70_CLEF_NMAX` | `34816` | Maximum record length in tokens; a request's `max_length` can only lower it. Head memory is 2 KiB per token per slot: 32,768 costs +64 MiB on rank 0 over 16,384 (Clef's own default and the code default). The head is verified against a PyTorch fp32 reference at 32,768 and 34,816 |
+| `FA2SM70_CLEF_A1` | `1` (**stand**, code default `0`) | A record preempted mid-prefill and restarted from position 0 releases its head slot and is admitted again. At `0` its span means are accumulated twice |
 | `FA2SM70_CLEF_MEDIA` | `1` | Accept `"images"` in Clef records. `0` (code default) rejects them with 400 |
 | `FA2SM70_CLEF_IMGMAX` | `16` | Images per Clef record |
 | `FA2SM70_CLEF_NSLOT` | `3` | Ring slots for streaming LoRA layers 40–63 from pinned host memory |
